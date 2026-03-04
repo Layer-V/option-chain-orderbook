@@ -190,8 +190,8 @@ impl OptionOrderBook {
     pub fn status(&self) -> InstrumentStatus {
         let raw = self.status.load(Ordering::Acquire);
         // SAFETY: we only ever store valid InstrumentStatus u8 values.
-        // Fallback to Active if the value is somehow corrupted.
-        InstrumentStatus::from_u8(raw).unwrap_or(InstrumentStatus::Active)
+        // Fail closed: corrupted values reject orders instead of accepting them.
+        InstrumentStatus::from_u8(raw).unwrap_or(InstrumentStatus::Halted)
     }
 
     /// Sets the lifecycle status of this instrument.
