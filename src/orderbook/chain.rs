@@ -3,6 +3,7 @@
 //! This module provides the [`OptionChainOrderBook`] and [`OptionChainOrderBookManager`]
 //! for managing all strikes within a single expiration.
 
+use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
@@ -82,6 +83,21 @@ impl OptionChainOrderBook {
     #[must_use]
     pub fn strikes_arc(&self) -> Arc<StrikeOrderBookManager> {
         Arc::clone(&self.strikes)
+    }
+
+    /// Sets the contract specifications for this chain.
+    ///
+    /// Also propagates the specs to the strike manager for newly created strikes.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.strikes.set_specs(specs);
+    }
+
+    /// Returns the current contract specifications, if any.
+    ///
+    /// Delegates to the strike manager to maintain a single source of truth.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.strikes.specs()
     }
 
     /// Sets the validation config for all future strikes created within this chain.
@@ -186,6 +202,8 @@ pub struct OptionChainOrderBookManager {
     underlying: String,
     /// Validation config applied to newly created chains.
     validation_config: SharedValidationConfig,
+    /// Contract specs propagated to newly created chains.
+    contract_specs: SharedContractSpecs,
 }
 
 impl OptionChainOrderBookManager {
@@ -200,7 +218,22 @@ impl OptionChainOrderBookManager {
             chains: SkipMap::new(),
             underlying: underlying.into(),
             validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
         }
+    }
+
+    /// Sets the contract specs for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.contract_specs.set(specs);
+    }
+
+    /// Returns the current contract specs, if any.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.contract_specs.get()
     }
 
     /// Sets the validation config for all future chains created by this manager.
@@ -246,6 +279,9 @@ impl OptionChainOrderBookManager {
         let chain = Arc::new(OptionChainOrderBook::new(&self.underlying, expiration));
         if let Some(ref config) = self.validation_config.get() {
             chain.set_validation(config.clone());
+        }
+        if let Some(ref specs) = self.contract_specs.get() {
+            chain.set_specs(specs.clone());
         }
         self.chains.insert(expiration, Arc::clone(&chain));
         chain

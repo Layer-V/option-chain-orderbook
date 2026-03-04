@@ -4,6 +4,7 @@
 //! for managing all expirations for a single underlying asset.
 
 use super::chain::OptionChainOrderBook;
+use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::strike::StrikeOrderBook;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
@@ -84,6 +85,14 @@ impl ExpirationOrderBook {
         Arc::clone(&self.chain)
     }
 
+    /// Returns the contract specifications, if any.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::specs`].
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.chain.specs()
+    }
+
     /// Sets the validation config for all future strikes created within this expiration.
     ///
     /// Delegates to the underlying [`OptionChainOrderBook::set_validation`].
@@ -156,6 +165,8 @@ pub struct ExpirationOrderBookManager {
     underlying: String,
     /// Validation config applied to newly created expiration books.
     validation_config: SharedValidationConfig,
+    /// Contract specs propagated to newly created expiration books.
+    contract_specs: SharedContractSpecs,
 }
 
 impl ExpirationOrderBookManager {
@@ -170,7 +181,22 @@ impl ExpirationOrderBookManager {
             expirations: SkipMap::new(),
             underlying: underlying.into(),
             validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
         }
+    }
+
+    /// Sets the contract specs for all future expirations created by this manager.
+    ///
+    /// Existing expiration books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.contract_specs.set(specs);
+    }
+
+    /// Returns the current contract specs, if any.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.contract_specs.get()
     }
 
     /// Sets the validation config for all future expirations created by this manager.
@@ -216,6 +242,9 @@ impl ExpirationOrderBookManager {
         let book = Arc::new(ExpirationOrderBook::new(&self.underlying, expiration));
         if let Some(ref config) = self.validation_config.get() {
             book.set_validation(config.clone());
+        }
+        if let Some(ref specs) = self.contract_specs.get() {
+            book.chain().set_specs(specs.clone());
         }
         self.expirations.insert(expiration, Arc::clone(&book));
         book
