@@ -29,3 +29,6 @@ src/.DS_Store
 .secrets
 /Option-Chain-OrderBook.code-workspace
 /coverage/
+.windsurf/
+.internalDoc/
+/.windsurfrules
