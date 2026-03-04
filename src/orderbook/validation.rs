@@ -197,16 +197,26 @@ impl SharedValidationConfig {
     }
 
     /// Sets the validation config.
+    ///
+    /// Recovers from a poisoned lock to ensure the config is always written.
     pub(crate) fn set(&self, config: ValidationConfig) {
-        if let Ok(mut guard) = self.inner.write() {
-            *guard = Some(config);
-        }
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(config);
     }
 
     /// Returns a clone of the current validation config, if any.
+    ///
+    /// Recovers from a poisoned lock to avoid silently dropping a stored config.
     #[must_use]
     pub(crate) fn get(&self) -> Option<ValidationConfig> {
-        self.inner.read().ok().and_then(|guard| guard.clone())
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
     }
 }
 
