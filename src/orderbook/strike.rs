@@ -3,16 +3,19 @@
 //! This module provides the [`StrikeOrderBook`] and [`StrikeOrderBookManager`]
 //! for managing call/put pairs at a specific strike price.
 
-use super::book::OptionOrderBook;
+use super::book::{BookConfig, OptionOrderBook};
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::fees::SharedFeeSchedule;
+use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
+use super::stp::SharedSTPMode;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::OrderId;
+use orderbook_rs::{FeeSchedule, OrderId, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single strike price containing both call and put.
@@ -124,6 +127,31 @@ impl StrikeOrderBook {
         }
     }
 
+    /// Creates a new strike order book from pre-built call/put order books.
+    ///
+    /// Used internally by [`StrikeOrderBookManager`] when an instrument registry
+    /// is available, so that each `OptionOrderBook` already has a unique
+    /// instrument ID assigned.
+    #[must_use]
+    pub(crate) fn from_books(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        strike: u64,
+        call: Arc<OptionOrderBook>,
+        put: Arc<OptionOrderBook>,
+    ) -> Self {
+        Self {
+            underlying: underlying.into(),
+            expiration,
+            strike,
+            call,
+            put,
+            call_greeks: None,
+            put_greeks: None,
+            id: OrderId::new(),
+        }
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -146,6 +174,26 @@ impl StrikeOrderBook {
     #[must_use]
     pub const fn id(&self) -> OrderId {
         self.id
+    }
+
+    /// Returns the STP mode configured on the call book.
+    ///
+    /// Both call and put books share the same STP mode when created
+    /// through the hierarchy, so reading from the call book is sufficient.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.call.stp_mode()
+    }
+
+    /// Returns the fee schedule configured on the call book.
+    ///
+    /// Both call and put books share the same fee schedule when created
+    /// through the hierarchy, so reading from the call book is sufficient.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.call.fee_schedule()
     }
 
     /// Returns a reference to the call order book.
@@ -264,6 +312,12 @@ pub struct StrikeOrderBookManager {
     validation_config: SharedValidationConfig,
     /// Contract specs propagated to newly created strike books.
     contract_specs: SharedContractSpecs,
+    /// Instrument registry for allocating IDs to new option books.
+    registry: Option<Arc<InstrumentRegistry>>,
+    /// STP mode applied to newly created option books.
+    stp_mode: SharedSTPMode,
+    /// Fee schedule applied to newly created option books.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl StrikeOrderBookManager {
@@ -281,7 +335,45 @@ impl StrikeOrderBookManager {
             expiration,
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
+            registry: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
+    }
+
+    /// Creates a new strike order book manager with an instrument registry.
+    ///
+    /// When the registry is present, newly created strike books will have
+    /// their call/put [`OptionOrderBook`] instances assigned unique IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        Self {
+            strikes: SkipMap::new(),
+            underlying: underlying.into(),
+            expiration,
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
     }
 
     /// Sets the contract specs associated with this manager.
@@ -313,6 +405,47 @@ impl StrikeOrderBookManager {
         self.validation_config.get()
     }
 
+    /// Sets the STP mode for all future option books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will use this mode.
+    #[inline]
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future strike books.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will use this schedule.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future strike books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -341,26 +474,120 @@ impl StrikeOrderBookManager {
     ///
     /// If a validation config has been set via [`set_validation`](Self::set_validation),
     /// newly created strike books will have that config applied.
+    ///
+    /// If an instrument registry is present, each new call/put
+    /// [`OptionOrderBook`] is assigned a unique instrument ID and registered
+    /// in the reverse index.
+    ///
+    /// Uses a check-insert-check pattern: if two threads race to create the
+    /// same strike, only the first insertion's book survives and only that
+    /// book's IDs are registered in the reverse index.
     pub fn get_or_create(&self, strike: u64) -> Arc<StrikeOrderBook> {
         if let Some(entry) = self.strikes.get(&strike) {
             return Arc::clone(entry.value());
         }
-        let book = if let Some(ref config) = self.validation_config.get() {
-            Arc::new(StrikeOrderBook::new_with_validation(
-                &self.underlying,
-                self.expiration,
-                strike,
-                config,
-            ))
-        } else {
-            Arc::new(StrikeOrderBook::new(
-                &self.underlying,
-                self.expiration,
-                strike,
-            ))
-        };
+
+        // Build the book without allocating IDs yet.
+        let book = self.create_strike_book_without_ids(strike);
         self.strikes.insert(strike, Arc::clone(&book));
-        book
+
+        // Re-check: another thread may have inserted first.
+        if let Some(entry) = self.strikes.get(&strike) {
+            let winner = Arc::clone(entry.value());
+            if Arc::ptr_eq(&winner, &book) {
+                // We won the race — allocate and register IDs now.
+                self.assign_instrument_ids(&winner, strike);
+            }
+            winner
+        } else {
+            book
+        }
+    }
+
+    /// Internal helper that builds a [`StrikeOrderBook`] with optional
+    /// validation config, STP mode, and fee schedule but **without** allocating
+    /// instrument IDs.
+    ///
+    /// IDs are assigned later by [`assign_instrument_ids`](Self::assign_instrument_ids)
+    /// only after confirming the book won the insertion race.
+    fn create_strike_book_without_ids(&self, strike: u64) -> Arc<StrikeOrderBook> {
+        let exp_str = format_expiration_yyyymmdd(&self.expiration)
+            .unwrap_or_else(|_| self.expiration.to_string());
+        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+
+        let base_config = BookConfig {
+            validation: self.validation_config.get(),
+            stp_mode: self.stp_mode.get(),
+            fee_schedule: self.fee_schedule.get(),
+            ..BookConfig::default()
+        };
+
+        let call = Arc::new(OptionOrderBook::new_with_config(
+            &call_symbol,
+            OptionStyle::Call,
+            base_config.clone(),
+        ));
+        let put = Arc::new(OptionOrderBook::new_with_config(
+            &put_symbol,
+            OptionStyle::Put,
+            base_config,
+        ));
+
+        Arc::new(StrikeOrderBook::from_books(
+            &self.underlying,
+            self.expiration,
+            strike,
+            call,
+            put,
+        ))
+    }
+
+    /// Assigns unique instrument IDs and registers the call/put books in the
+    /// reverse index. Called only after confirming this book won the insertion race.
+    fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) {
+        if let Some(reg) = &self.registry {
+            let exp_str = format_expiration_yyyymmdd(&self.expiration)
+                .unwrap_or_else(|_| self.expiration.to_string());
+            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+
+            let call_id = reg.allocate();
+            let put_id = reg.allocate();
+
+            book.call().set_instrument_id(call_id);
+            book.put().set_instrument_id(put_id);
+
+            Self::register_pair(
+                reg,
+                &call_symbol,
+                &put_symbol,
+                call_id,
+                put_id,
+                self.expiration,
+                strike,
+            );
+        }
+    }
+
+    /// Registers a call/put pair in the instrument registry.
+    fn register_pair(
+        reg: &InstrumentRegistry,
+        call_symbol: &str,
+        put_symbol: &str,
+        call_id: u32,
+        put_id: u32,
+        expiration: ExpirationDate,
+        strike: u64,
+    ) {
+        reg.register(
+            call_id,
+            InstrumentInfo::new(call_symbol, expiration, strike, OptionStyle::Call),
+        );
+        reg.register(
+            put_id,
+            InstrumentInfo::new(put_symbol, expiration, strike, OptionStyle::Put),
+        );
     }
 
     /// Gets a strike order book by strike price.

@@ -4,12 +4,15 @@
 //! for managing all strikes within a single expiration.
 
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::fees::SharedFeeSchedule;
+use super::instrument_registry::InstrumentRegistry;
+use super::stp::SharedSTPMode;
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::OrderId;
+use orderbook_rs::{FeeSchedule, OrderId, STPMode};
 use std::sync::Arc;
 
 /// Option chain order book for a single expiration.
@@ -34,6 +37,8 @@ pub struct OptionChainOrderBook {
     strikes: Arc<StrikeOrderBookManager>,
     /// Unique identifier for this option chain order book.
     id: OrderId,
+    /// Instrument registry propagated to strike managers.
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl OptionChainOrderBook {
@@ -52,6 +57,38 @@ impl OptionChainOrderBook {
             underlying,
             expiration,
             id: OrderId::new(),
+            registry: None,
+        }
+    }
+
+    /// Creates a new option chain order book with an instrument registry.
+    ///
+    /// The registry is propagated to the internal [`StrikeOrderBookManager`]
+    /// so that newly created strikes get unique instrument IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            strikes: Arc::new(StrikeOrderBookManager::new_with_registry(
+                &underlying,
+                expiration,
+                Arc::clone(&registry),
+            )),
+            underlying,
+            expiration,
+            id: OrderId::new(),
+            registry: Some(registry),
         }
     }
 
@@ -77,6 +114,12 @@ impl OptionChainOrderBook {
     #[must_use]
     pub fn strikes(&self) -> &StrikeOrderBookManager {
         &self.strikes
+    }
+
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
     }
 
     /// Returns an Arc reference to the strike manager.
@@ -112,6 +155,47 @@ impl OptionChainOrderBook {
     #[must_use]
     pub fn validation_config(&self) -> Option<ValidationConfig> {
         self.strikes.validation_config()
+    }
+
+    /// Sets the STP mode for all future option books created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_stp_mode`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.strikes.set_stp_mode(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.strikes.stp_mode()
+    }
+
+    /// Sets the fee schedule for all future option books created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.strikes.set_fee_schedule(schedule);
+    }
+
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.strikes.clear_fee_schedule();
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.strikes.fee_schedule()
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -204,6 +288,12 @@ pub struct OptionChainOrderBookManager {
     validation_config: SharedValidationConfig,
     /// Contract specs propagated to newly created chains.
     contract_specs: SharedContractSpecs,
+    /// Instrument registry propagated to newly created chains.
+    registry: Option<Arc<InstrumentRegistry>>,
+    /// STP mode propagated to newly created chains.
+    stp_mode: SharedSTPMode,
+    /// Fee schedule propagated to newly created chains.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl OptionChainOrderBookManager {
@@ -219,6 +309,35 @@ impl OptionChainOrderBookManager {
             underlying: underlying.into(),
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
+            registry: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Creates a new option chain manager with an instrument registry.
+    ///
+    /// The registry is propagated to newly created chains and their
+    /// strike managers.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        Self {
+            chains: SkipMap::new(),
+            underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -250,6 +369,47 @@ impl OptionChainOrderBookManager {
         self.validation_config.get()
     }
 
+    /// Sets the STP mode for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    #[inline]
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future chains have no fees configured.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
+    }
+
     /// Returns the underlying asset symbol.
     #[must_use]
     pub fn underlying(&self) -> &str {
@@ -276,12 +436,27 @@ impl OptionChainOrderBookManager {
         if let Some(entry) = self.chains.get(&expiration) {
             return Arc::clone(entry.value());
         }
-        let chain = Arc::new(OptionChainOrderBook::new(&self.underlying, expiration));
+        let chain = if let Some(ref reg) = self.registry {
+            Arc::new(OptionChainOrderBook::new_with_registry(
+                &self.underlying,
+                expiration,
+                Arc::clone(reg),
+            ))
+        } else {
+            Arc::new(OptionChainOrderBook::new(&self.underlying, expiration))
+        };
         if let Some(ref config) = self.validation_config.get() {
             chain.set_validation(config.clone());
         }
         if let Some(ref specs) = self.contract_specs.get() {
             chain.set_specs(specs.clone());
+        }
+        let stp = self.stp_mode.get();
+        if stp != STPMode::None {
+            chain.set_stp_mode(stp);
+        }
+        if let Some(schedule) = self.fee_schedule.get() {
+            chain.set_fee_schedule(schedule);
         }
         self.chains.insert(expiration, Arc::clone(&chain));
         chain

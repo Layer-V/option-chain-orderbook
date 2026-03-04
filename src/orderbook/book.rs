@@ -8,11 +8,32 @@ use super::quote::Quote;
 use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
-use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, Side, TimeInForce};
+use orderbook_rs::{
+    DefaultOrderBook, FeeSchedule, OrderBookSnapshot, OrderId, STPMode, Side, TimeInForce,
+    TradeResult,
+};
+use pricelevel::{Hash32, MatchResult};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Internal configuration for constructing an [`OptionOrderBook`].
+///
+/// Consolidates all optional configuration (instrument ID, validation,
+/// STP mode, fee schedule) into a single struct, avoiding constructor
+/// explosion as new features are added.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BookConfig {
+    /// Numeric instrument ID (0 for standalone books).
+    pub instrument_id: u32,
+    /// Optional pre-trade validation rules.
+    pub validation: Option<ValidationConfig>,
+    /// Self-trade prevention mode ([`STPMode::None`] by default).
+    pub stp_mode: STPMode,
+    /// Optional fee schedule for maker/taker fees.
+    pub fee_schedule: Option<FeeSchedule>,
+}
 
 /// Order book for a single option contract.
 ///
@@ -48,9 +69,73 @@ pub struct OptionOrderBook {
     id: OrderId,
     /// Lifecycle status of this instrument, stored as atomic u8.
     status: AtomicU8,
+    /// Numeric instrument ID for fast lookups and compact wire representation.
+    /// Stored as `AtomicU32` so it can be assigned after construction
+    /// without requiring `&mut self`.
+    instrument_id: AtomicU32,
+    /// Captured trade result from the last order submission.
+    ///
+    /// Populated by the internal trade listener when a matching occurs.
+    /// Used by the `_full` order methods to return [`TradeResult`].
+    last_trade_result: Arc<Mutex<Option<TradeResult>>>,
 }
 
 impl OptionOrderBook {
+    // ── Core constructor ────────────────────────────────────────────────
+
+    /// Creates an option order book from a [`BookConfig`].
+    ///
+    /// This is the single internal constructor that all other constructors
+    /// delegate to. It creates a `DefaultOrderBook`, applies STP, validation,
+    /// and fee schedule, installs the trade-capture listener, and wraps the
+    /// result in `Arc`.
+    #[must_use]
+    pub(crate) fn new_with_config(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        config: BookConfig,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+
+        let mut book = if config.stp_mode != STPMode::None {
+            DefaultOrderBook::with_stp_mode(&symbol, config.stp_mode)
+        } else {
+            DefaultOrderBook::new(&symbol)
+        };
+
+        if let Some(ref validation) = config.validation {
+            Self::apply_validation(&mut book, validation);
+        }
+        if let Some(schedule) = config.fee_schedule {
+            book.set_fee_schedule(Some(schedule));
+        }
+
+        // Install trade-capture listener so `_full` methods can return TradeResult
+        let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
+        let capture_clone = Arc::clone(&capture);
+        book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
+            let mut guard = capture_clone
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(tr.clone());
+        }));
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(config.instrument_id),
+            last_trade_result: capture,
+        }
+    }
+
+    // ── Public constructors ─────────────────────────────────────────────
+
     /// Creates a new option order book for the given symbol.
     ///
     /// # Arguments
@@ -59,18 +144,34 @@ impl OptionOrderBook {
     /// * `option_style` - The option style (Call or Put)
     #[must_use]
     pub fn new(symbol: impl Into<String>, option_style: OptionStyle) -> Self {
-        let symbol = symbol.into();
-        let symbol_hash = Self::hash_symbol(&symbol);
+        Self::new_with_config(symbol, option_style, BookConfig::default())
+    }
 
-        Self {
-            symbol: symbol.clone(),
-            symbol_hash,
-            book: Arc::new(DefaultOrderBook::new(&symbol)),
-            last_quote: Arc::new(Quote::empty(0)),
+    /// Creates a new option order book with a pre-assigned instrument ID.
+    ///
+    /// Used internally by the hierarchy when an [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry)
+    /// is available.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `instrument_id` - The unique numeric instrument ID
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_id(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        instrument_id: u32,
+    ) -> Self {
+        Self::new_with_config(
+            symbol,
             option_style,
-            id: OrderId::new(),
-            status: AtomicU8::new(InstrumentStatus::Active as u8),
-        }
+            BookConfig {
+                instrument_id,
+                ..BookConfig::default()
+            },
+        )
     }
 
     /// Creates a new option order book with pre-trade validation configured.
@@ -89,10 +190,42 @@ impl OptionOrderBook {
         option_style: OptionStyle,
         config: &ValidationConfig,
     ) -> Self {
-        let symbol = symbol.into();
-        let symbol_hash = Self::hash_symbol(&symbol);
-        let mut book = DefaultOrderBook::new(&symbol);
+        Self::new_with_config(
+            symbol,
+            option_style,
+            BookConfig {
+                validation: Some(config.clone()),
+                ..BookConfig::default()
+            },
+        )
+    }
 
+    /// Creates a new option order book with STP mode configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `stp_mode` - Self-trade prevention mode
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_stp(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        stp_mode: STPMode,
+    ) -> Self {
+        Self::new_with_config(
+            symbol,
+            option_style,
+            BookConfig {
+                stp_mode,
+                ..BookConfig::default()
+            },
+        )
+    }
+
+    /// Applies validation config to a mutable order book before wrapping in `Arc`.
+    fn apply_validation(book: &mut DefaultOrderBook, config: &ValidationConfig) {
         if let Some(tick) = config.tick_size() {
             book.set_tick_size(tick);
         }
@@ -104,16 +237,6 @@ impl OptionOrderBook {
         }
         if let Some(max) = config.max_order_size() {
             book.set_max_order_size(max);
-        }
-
-        Self {
-            symbol,
-            symbol_hash,
-            book: Arc::new(book),
-            last_quote: Arc::new(Quote::empty(0)),
-            option_style,
-            id: OrderId::new(),
-            status: AtomicU8::new(InstrumentStatus::Active as u8),
         }
     }
 
@@ -184,6 +307,62 @@ impl OptionOrderBook {
         Arc::clone(&self.book)
     }
 
+    /// Returns the numeric instrument ID.
+    ///
+    /// Returns 0 for standalone books created outside the hierarchy.
+    /// Hierarchy-created books get unique IDs from the
+    /// [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry).
+    #[must_use]
+    #[inline]
+    pub fn instrument_id(&self) -> u32 {
+        self.instrument_id.load(Ordering::Relaxed)
+    }
+
+    /// Sets the instrument ID after construction.
+    ///
+    /// Used by the hierarchy to assign IDs only after confirming the book
+    /// won the insertion race in [`StrikeOrderBookManager::get_or_create`](super::strike::StrikeOrderBookManager::get_or_create).
+    #[inline]
+    pub(crate) fn set_instrument_id(&self, id: u32) {
+        self.instrument_id.store(id, Ordering::Relaxed);
+    }
+
+    /// Returns the configured self-trade prevention mode.
+    ///
+    /// [`STPMode::None`] means STP is disabled (default).
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.book.stp_mode()
+    }
+
+    /// Returns the configured fee schedule, or `None` if no fees are applied.
+    ///
+    /// When `Some`, maker and taker fees (in basis points) are applied to
+    /// trades. Use [`TradeResult`] from `_full` order methods to access
+    /// computed fee amounts.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.book.fee_schedule()
+    }
+
+    /// Returns the trade result captured from the last order submission,
+    /// or `None` if no match occurred.
+    ///
+    /// This is populated by the internal trade listener whenever a matching
+    /// event occurs. Prefer the `_full` order methods for reliable access.
+    ///
+    /// **Note:** concurrent calls to order methods on the same book may
+    /// overwrite this value before it is read.
+    #[must_use]
+    pub fn last_trade_result(&self) -> Option<TradeResult> {
+        self.last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Returns the current lifecycle status of this instrument.
     #[must_use]
     #[inline]
@@ -241,10 +420,7 @@ impl OptionOrderBook {
         if current.is_accepting_orders() {
             Ok(())
         } else {
-            Err(crate::Error::instrument_not_active(
-                &self.symbol,
-                current.to_string(),
-            ))
+            Err(crate::Error::instrument_not_active(&self.symbol, current))
         }
     }
 
@@ -302,6 +478,214 @@ impl OptionOrderBook {
             .add_limit_order(order_id, price, quantity, side, tif, None)
             .map_err(|e| crate::Error::orderbook(e.to_string()))?;
         Ok(())
+    }
+
+    /// Adds a limit order with user identity for self-trade prevention.
+    ///
+    /// When STP is enabled on this book, the `user_id` is used to detect
+    /// self-trades. Use [`Hash32::zero()`] to bypass STP checks.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `quantity` - Order quantity in smallest units (u64)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order
+    ///   (e.g., `MissingUserId` when STP is enabled and `user_id` is zero).
+    pub fn add_limit_order_with_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.check_active()?;
+        self.book
+            .add_limit_order_with_user(
+                order_id,
+                price,
+                quantity,
+                side,
+                TimeInForce::Gtc,
+                user_id,
+                None,
+            )
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Adds a limit order with time-in-force and user identity for STP.
+    ///
+    /// Combines time-in-force specification with self-trade prevention.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `quantity` - Order quantity in smallest units (u64)
+    /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    pub fn add_limit_order_with_tif_and_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.check_active()?;
+        self.book
+            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(())
+    }
+
+    // ── Full order methods (return TradeResult) ─────────────────────────
+
+    /// Clears the captured trade result before submitting an order.
+    fn clear_trade_capture(&self) {
+        let mut guard = self
+            .last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+    }
+
+    /// Extracts the captured [`TradeResult`], or creates an empty one
+    /// (no trades, zero fees) when the order rested without matching.
+    #[must_use]
+    fn extract_trade_result(&self, order_id: OrderId, quantity: u64) -> TradeResult {
+        self.last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| {
+                TradeResult::new(self.symbol.clone(), MatchResult::new(order_id, quantity))
+            })
+    }
+
+    /// Adds a limit order and returns the full [`TradeResult`] including fees.
+    ///
+    /// Unlike [`add_limit_order`](Self::add_limit_order), this method returns
+    /// the trade result with maker/taker fee fields populated according to
+    /// the configured [`FeeSchedule`].
+    ///
+    /// **Concurrency note:** concurrent `_full` calls on the same book are
+    /// not guaranteed to return the correct result for each caller. Use the
+    /// regular `add_limit_order` methods for concurrent workloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    /// [`Active`](InstrumentStatus::Active).
+    pub fn add_limit_order_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.clear_trade_capture();
+        self.book
+            .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(self.extract_trade_result(order_id, quantity))
+    }
+
+    /// Adds a limit order with time-in-force and returns the full [`TradeResult`].
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    pub fn add_limit_order_with_tif_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.clear_trade_capture();
+        self.book
+            .add_limit_order(order_id, price, quantity, side, tif, None)
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(self.extract_trade_result(order_id, quantity))
+    }
+
+    /// Adds a limit order with user identity and returns the full [`TradeResult`].
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    pub fn add_limit_order_with_user_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        user_id: Hash32,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.clear_trade_capture();
+        self.book
+            .add_limit_order_with_user(
+                order_id,
+                price,
+                quantity,
+                side,
+                TimeInForce::Gtc,
+                user_id,
+                None,
+            )
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(self.extract_trade_result(order_id, quantity))
+    }
+
+    /// Adds a limit order with time-in-force, user identity, and returns
+    /// the full [`TradeResult`].
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    pub fn add_limit_order_with_tif_and_user_full(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<TradeResult> {
+        self.check_active()?;
+        self.clear_trade_capture();
+        self.book
+            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(self.extract_trade_result(order_id, quantity))
     }
 
     /// Cancels an order by its ID.
@@ -1065,5 +1449,449 @@ mod tests {
         let cancelled = book.cancel_order(oid).unwrap();
         assert!(cancelled);
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn test_default_instrument_id_is_zero() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_id() {
+        let book = OptionOrderBook::new_with_id("BTC-20240329-50000-C", OptionStyle::Call, 42);
+        assert_eq!(book.instrument_id(), 42);
+        assert_eq!(book.symbol(), "BTC-20240329-50000-C");
+    }
+
+    #[test]
+    fn test_new_with_validation_has_zero_id() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_config_id_and_validation() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                instrument_id: 99,
+                validation: Some(config),
+                ..BookConfig::default()
+            },
+        );
+        assert_eq!(book.instrument_id(), 99);
+        let vc = book.validation_config();
+        assert!(vc.is_some());
+        assert_eq!(vc.unwrap().tick_size(), Some(10));
+    }
+
+    #[test]
+    fn test_stp_mode_default_is_none() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.stp_mode(), STPMode::None);
+    }
+
+    #[test]
+    fn test_new_with_stp_cancel_taker() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_config_id_and_stp() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                instrument_id: 42,
+                stp_mode: STPMode::CancelMaker,
+                ..BookConfig::default()
+            },
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelMaker);
+        assert_eq!(book.instrument_id(), 42);
+    }
+
+    #[test]
+    fn test_new_with_config_validation_and_stp() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                validation: Some(config),
+                stp_mode: STPMode::CancelBoth,
+                ..BookConfig::default()
+            },
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelBoth);
+        assert_eq!(
+            book.validation_config().map(|c| c.tick_size()),
+            Some(Some(10))
+        );
+    }
+
+    #[test]
+    fn test_new_with_config_id_validation_and_stp() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                instrument_id: 7,
+                validation: Some(config),
+                stp_mode: STPMode::CancelTaker,
+                ..BookConfig::default()
+            },
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+        assert_eq!(book.instrument_id(), 7);
+        assert_eq!(
+            book.validation_config().map(|c| c.tick_size()),
+            Some(Some(10))
+        );
+    }
+
+    #[test]
+    fn test_add_limit_order_with_user() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user = Hash32::from([1u8; 32]);
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_ok());
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_tif_and_user() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user = Hash32::from([2u8; 32]);
+        let result = book.add_limit_order_with_tif_and_user(
+            OrderId::new(),
+            Side::Sell,
+            200,
+            5,
+            TimeInForce::Gtc,
+            user,
+        );
+        assert!(result.is_ok());
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_stp_cancel_taker_prevents_self_trade() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — STP triggers, returns error
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+        // Maker (sell) should still be there
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_ask().is_some());
+    }
+
+    #[test]
+    fn test_stp_cancel_maker_removes_resting_order() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelMaker,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — maker cancelled, taker rests
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user)
+            .unwrap();
+        // Taker (buy) should now be resting, maker (sell) was cancelled
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_bid().is_some());
+    }
+
+    #[test]
+    fn test_stp_cancel_both_removes_all() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelBoth,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — STP triggers, returns error
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stp_different_users_trade_normally() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        // User A sells
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user_a)
+            .unwrap();
+
+        // User B buys — should trade normally
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_b)
+            .unwrap();
+        // Both matched and removed
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_user_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+        let user = Hash32::from([1u8; 32]);
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+    }
+
+    // ── Fee schedule tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_fee_schedule_default_is_none() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.fee_schedule().is_none());
+    }
+
+    #[test]
+    fn test_fee_schedule_via_config() {
+        let schedule = FeeSchedule::new(-2, 5);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(schedule),
+                ..BookConfig::default()
+            },
+        );
+        let fs = book.fee_schedule();
+        assert!(fs.is_some());
+        let s = fs.unwrap();
+        assert_eq!(s.maker_fee_bps, -2);
+        assert_eq!(s.taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_fee_schedule_with_stp_and_validation() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let schedule = FeeSchedule::new(-5, 10);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                instrument_id: 42,
+                validation: Some(config),
+                stp_mode: STPMode::CancelTaker,
+                fee_schedule: Some(schedule),
+            },
+        );
+        assert_eq!(book.instrument_id(), 42);
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+        assert!(book.validation_config().is_some());
+        let fs = book.fee_schedule().unwrap();
+        assert_eq!(fs.maker_fee_bps, -5);
+        assert_eq!(fs.taker_fee_bps, 10);
+    }
+
+    #[test]
+    fn test_add_limit_order_full_no_match() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(FeeSchedule::new(-2, 5)),
+                ..BookConfig::default()
+            },
+        );
+        // Single order, no match — returns empty TradeResult
+        let result = book
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        assert_eq!(result.total_maker_fees, 0);
+        assert_eq!(result.total_taker_fees, 0);
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_limit_order_full_with_match_and_fees() {
+        let schedule = FeeSchedule::new(-2, 5);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(schedule),
+                ..BookConfig::default()
+            },
+        );
+        // Place a resting sell order
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .unwrap();
+
+        // Aggressive buy matches the sell — trade occurs, fees calculated
+        let result = book
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+
+        // Taker fee: notional * taker_bps / 10_000 = (100 * 10) * 5 / 10_000 = 0
+        // For small notionals, fees may round to zero. Just verify the fields exist
+        // and the trade was executed.
+        assert_eq!(book.order_count(), 0);
+        // The result should be a real TradeResult from the matching engine
+        assert_eq!(result.symbol, "BTC-20240329-50000-C");
+    }
+
+    #[test]
+    fn test_add_limit_order_full_zero_fees_by_default() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Place a resting sell
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .unwrap();
+        // Aggressive buy with _full — no fee schedule, so zero fees
+        let result = book
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        assert_eq!(result.total_maker_fees, 0);
+        assert_eq!(result.total_taker_fees, 0);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_tif_full() {
+        let schedule = FeeSchedule::new(0, 10);
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(schedule),
+                ..BookConfig::default()
+            },
+        );
+        let result = book
+            .add_limit_order_with_tif_full(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
+            .unwrap();
+        // No match, so zero fees
+        assert_eq!(result.total_taker_fees, 0);
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_user_full() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(FeeSchedule::new(0, 5)),
+                ..BookConfig::default()
+            },
+        );
+        let user = Hash32::from([1u8; 32]);
+        let result = book
+            .add_limit_order_with_user_full(OrderId::new(), Side::Buy, 100, 10, user)
+            .unwrap();
+        assert_eq!(result.total_taker_fees, 0);
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_tif_and_user_full() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                fee_schedule: Some(FeeSchedule::new(0, 5)),
+                ..BookConfig::default()
+            },
+        );
+        let user = Hash32::from([1u8; 32]);
+        let result = book
+            .add_limit_order_with_tif_and_user_full(
+                OrderId::new(),
+                Side::Sell,
+                200,
+                5,
+                TimeInForce::Gtc,
+                user,
+            )
+            .unwrap();
+        assert_eq!(result.total_taker_fees, 0);
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_last_trade_result_none_initially() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.last_trade_result().is_none());
+    }
+
+    #[test]
+    fn test_last_trade_result_populated_after_match() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .unwrap();
+        // Trigger a match
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        // last_trade_result should now be populated
+        let tr = book.last_trade_result();
+        assert!(tr.is_some());
+    }
+
+    #[test]
+    fn test_full_method_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+        let result = book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_backward_compat_no_fee_schedule_zero_fees() {
+        // Verifies that existing code path without fee schedule still works
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.fee_schedule().is_none());
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .unwrap();
+        let result = book
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        assert_eq!(result.total_maker_fees, 0);
+        assert_eq!(result.total_taker_fees, 0);
     }
 }
