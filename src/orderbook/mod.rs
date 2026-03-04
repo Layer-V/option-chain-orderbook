@@ -49,6 +49,7 @@
 
 mod book;
 mod chain;
+mod contract_specs;
 mod expiration;
 mod quote;
 mod strike;
@@ -58,6 +59,7 @@ mod validation;
 // Re-export all public types
 pub use book::OptionOrderBook;
 pub use chain::{OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats};
+pub use contract_specs::{ContractSpecs, ContractSpecsBuilder, ExerciseStyle, SettlementType};
 pub use expiration::{ExpirationManagerStats, ExpirationOrderBook, ExpirationOrderBookManager};
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeOrderBook, StrikeOrderBookManager};

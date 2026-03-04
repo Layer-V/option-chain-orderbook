@@ -3,6 +3,7 @@
 //! This module provides the [`UnderlyingOrderBook`] and [`UnderlyingOrderBookManager`]
 //! for managing all underlyings in the system.
 
+use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
@@ -28,6 +29,8 @@ pub struct UnderlyingOrderBook {
     underlying: String,
     /// Expiration order book manager.
     expirations: ExpirationOrderBookManager,
+    /// Contract specifications for this underlying.
+    specs: SharedContractSpecs,
 }
 
 impl UnderlyingOrderBook {
@@ -43,6 +46,7 @@ impl UnderlyingOrderBook {
         Self {
             expirations: ExpirationOrderBookManager::new(&underlying),
             underlying,
+            specs: SharedContractSpecs::new(),
         }
     }
 
@@ -56,6 +60,27 @@ impl UnderlyingOrderBook {
     #[must_use]
     pub const fn expirations(&self) -> &ExpirationOrderBookManager {
         &self.expirations
+    }
+
+    /// Sets the contract specifications for this underlying.
+    ///
+    /// Automatically derives and applies a [`ValidationConfig`] from the specs'
+    /// tick size, lot size, min/max order size fields. This validation config
+    /// is propagated to all future expirations and strikes.
+    ///
+    /// Existing expiration books and strikes are not affected by the derived
+    /// validation config.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        let validation = specs.to_validation_config();
+        self.expirations.set_specs(specs.clone());
+        self.specs.set(specs);
+        self.expirations.set_validation(validation);
+    }
+
+    /// Returns the current contract specifications, if any.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.specs.get()
     }
 
     /// Sets the validation config for all future expirations and strikes
@@ -608,6 +633,211 @@ mod tests {
 
         let exp = book.get_or_create_expiration(test_expiration());
         let strike = exp.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_underlying_no_specs_by_default() {
+        let book = UnderlyingOrderBook::new("BTC");
+        assert!(book.specs().is_none());
+    }
+
+    #[test]
+    fn test_underlying_set_specs() {
+        use crate::orderbook::contract_specs::{ContractSpecs, ExerciseStyle, SettlementType};
+
+        let book = UnderlyingOrderBook::new("BTC");
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(10)
+            .contract_size(1)
+            .min_order_size(5)
+            .max_order_size(1000)
+            .settlement(SettlementType::Cash)
+            .exercise_style(ExerciseStyle::European)
+            .settlement_currency("USDC")
+            .build();
+
+        book.set_specs(specs.clone());
+
+        assert_eq!(book.specs(), Some(specs));
+    }
+
+    #[test]
+    fn test_underlying_set_specs_derives_validation() {
+        use crate::orderbook::contract_specs::ContractSpecs;
+
+        let book = UnderlyingOrderBook::new("BTC");
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(10)
+            .min_order_size(5)
+            .max_order_size(1000)
+            .build();
+
+        book.set_specs(specs);
+
+        // Validation should be auto-derived
+        let config = book.validation_config();
+        assert!(config.is_some());
+        let config = config.unwrap();
+        assert_eq!(config.tick_size(), Some(100));
+        assert_eq!(config.lot_size(), Some(10));
+        assert_eq!(config.min_order_size(), Some(5));
+        assert_eq!(config.max_order_size(), Some(1000));
+    }
+
+    #[test]
+    fn test_underlying_set_specs_enforces_validation_on_new_strikes() {
+        use crate::orderbook::contract_specs::ContractSpecs;
+
+        let book = UnderlyingOrderBook::new("BTC");
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(10)
+            .min_order_size(10)
+            .max_order_size(1000)
+            .build();
+
+        book.set_specs(specs);
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        // Valid: price=200 (tick 100), qty=20 (lot 10, range 10..1000)
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 20)
+                .is_ok()
+        );
+
+        // Invalid tick
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 20)
+                .is_err()
+        );
+
+        // Invalid lot
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 15)
+                .is_err()
+        );
+
+        // Too small
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 5)
+                .is_err()
+        );
+
+        // Too large
+        assert!(
+            strike
+                .put()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 2000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_underlying_specs_propagate_through_full_hierarchy() {
+        use crate::orderbook::contract_specs::{ContractSpecs, ExerciseStyle, SettlementType};
+
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+
+        let specs = ContractSpecs::builder()
+            .tick_size(100)
+            .lot_size(10)
+            .contract_size(1)
+            .min_order_size(10)
+            .max_order_size(1000)
+            .settlement(SettlementType::Cash)
+            .exercise_style(ExerciseStyle::European)
+            .settlement_currency("USDC")
+            .build();
+
+        btc.set_specs(specs.clone());
+
+        // Create expiration after specs are set
+        let exp = btc.get_or_create_expiration(test_expiration());
+
+        // Specs should be accessible from expiration
+        assert_eq!(exp.specs(), Some(specs.clone()));
+
+        // Specs should be accessible from chain
+        assert_eq!(exp.chain().specs(), Some(specs.clone()));
+
+        // Validation should enforce tick size on new strikes
+        let strike = exp.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 20)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 20)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_underlying_specs_existing_expiration_unaffected() {
+        use crate::orderbook::contract_specs::ContractSpecs;
+
+        let book = UnderlyingOrderBook::new("BTC");
+
+        // Create expiration BEFORE setting specs
+        let exp_before = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
+
+        // Set specs after
+        book.set_specs(ContractSpecs::builder().tick_size(100).build());
+
+        // Existing expiration's new strikes are NOT affected by validation
+        let strike = exp_before.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_ok()
+        );
+
+        // New expiration IS affected
+        let exp_after = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let strike2 = exp_after.get_or_create_strike(50000);
+        assert!(
+            strike2
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_underlying_default_specs_are_permissive() {
+        use crate::orderbook::contract_specs::ContractSpecs;
+
+        let book = UnderlyingOrderBook::new("BTC");
+        book.set_specs(ContractSpecs::default());
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        // Default specs: tick=1, lot=1, min=1, max=u64::MAX → everything passes
         assert!(
             strike
                 .call()
