@@ -12,7 +12,7 @@ use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, Side, TimeInFor
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 /// Order book for a single option contract.
 ///
@@ -49,7 +49,9 @@ pub struct OptionOrderBook {
     /// Lifecycle status of this instrument, stored as atomic u8.
     status: AtomicU8,
     /// Numeric instrument ID for fast lookups and compact wire representation.
-    instrument_id: u32,
+    /// Stored as `AtomicU32` so it can be assigned after construction
+    /// without requiring `&mut self`.
+    instrument_id: AtomicU32,
 }
 
 impl OptionOrderBook {
@@ -72,7 +74,7 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
-            instrument_id: 0,
+            instrument_id: AtomicU32::new(0),
         }
     }
 
@@ -87,6 +89,7 @@ impl OptionOrderBook {
     /// * `option_style` - The option style (Call or Put)
     /// * `instrument_id` - The unique numeric instrument ID
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn new_with_id(
         symbol: impl Into<String>,
         option_style: OptionStyle,
@@ -103,7 +106,7 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
-            instrument_id,
+            instrument_id: AtomicU32::new(instrument_id),
         }
     }
 
@@ -148,7 +151,7 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
-            instrument_id: 0,
+            instrument_id: AtomicU32::new(0),
         }
     }
 
@@ -166,6 +169,7 @@ impl OptionOrderBook {
     /// * `instrument_id` - The unique numeric instrument ID
     /// * `config` - Validation configuration
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn new_with_id_and_validation(
         symbol: impl Into<String>,
         option_style: OptionStyle,
@@ -197,7 +201,7 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
-            instrument_id,
+            instrument_id: AtomicU32::new(instrument_id),
         }
     }
 
@@ -275,8 +279,17 @@ impl OptionOrderBook {
     /// [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry).
     #[must_use]
     #[inline]
-    pub const fn instrument_id(&self) -> u32 {
-        self.instrument_id
+    pub fn instrument_id(&self) -> u32 {
+        self.instrument_id.load(Ordering::Relaxed)
+    }
+
+    /// Sets the instrument ID after construction.
+    ///
+    /// Used by the hierarchy to assign IDs only after confirming the book
+    /// won the insertion race in [`StrikeOrderBookManager::get_or_create`](super::strike::StrikeOrderBookManager::get_or_create).
+    #[inline]
+    pub(crate) fn set_instrument_id(&self, id: u32) {
+        self.instrument_id.store(id, Ordering::Relaxed);
     }
 
     /// Returns the current lifecycle status of this instrument.

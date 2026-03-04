@@ -101,7 +101,7 @@ impl std::fmt::Display for InstrumentInfo {
 /// ## Thread Safety
 ///
 /// The allocator uses [`AtomicU32`] for lock-free ID generation.
-/// The reverse index uses [`DashMap`] for lock-free concurrent reads and writes.
+/// The reverse index uses [`DashMap`] for concurrent reads and writes via sharded locking.
 ///
 /// ## Seed Support
 ///
@@ -130,14 +130,16 @@ impl InstrumentRegistry {
     /// Creates a new instrument registry with IDs starting from the given seed.
     ///
     /// Use this to resume ID allocation after a hierarchy rebuild.
+    /// The seed is clamped to a minimum of 1 since ID 0 is reserved
+    /// for standalone books.
     ///
     /// # Arguments
     ///
-    /// * `seed` - The starting ID value
+    /// * `seed` - The starting ID value (clamped to >= 1)
     #[must_use]
     pub fn new_with_seed(seed: u32) -> Self {
         Self {
-            next_id: AtomicU32::new(seed),
+            next_id: AtomicU32::new(seed.max(1)),
             index: DashMap::new(),
         }
     }
@@ -147,9 +149,17 @@ impl InstrumentRegistry {
     /// IDs are monotonically increasing and never reused.
     /// Uses `Ordering::Relaxed` since the only invariant is uniqueness,
     /// not ordering relative to other memory operations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `u32` counter is exhausted (> 4 billion instruments).
     #[inline]
     pub fn allocate(&self) -> u32 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        self.next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("instrument ID counter exhausted")
     }
 
     /// Registers an instrument in the reverse index.
@@ -392,5 +402,12 @@ mod tests {
         let registry = InstrumentRegistry::default();
         assert_eq!(registry.current_id(), 1);
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn test_seed_zero_clamped_to_one() {
+        let registry = InstrumentRegistry::new_with_seed(0);
+        assert_eq!(registry.current_id(), 1);
+        assert_eq!(registry.allocate(), 1);
     }
 }
