@@ -5,6 +5,7 @@
 
 use super::chain::OptionChainOrderBook;
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
 use super::strike::StrikeOrderBook;
@@ -12,7 +13,7 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, OrderId, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single expiration date.
@@ -159,6 +160,20 @@ impl ExpirationOrderBook {
         self.chain.stp_mode()
     }
 
+    /// Sets the fee schedule for all future option books created within this expiration.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::set_fee_schedule`].
+    /// Existing books are not affected.
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.chain.set_fee_schedule(schedule);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.chain.fee_schedule()
+    }
+
     /// Gets or creates a strike order book, returning an Arc reference.
     pub fn get_or_create_strike(&self, strike: u64) -> Arc<StrikeOrderBook> {
         self.chain.get_or_create_strike(strike)
@@ -223,6 +238,8 @@ pub struct ExpirationOrderBookManager {
     registry: Option<Arc<InstrumentRegistry>>,
     /// STP mode propagated to newly created expiration books.
     stp_mode: SharedSTPMode,
+    /// Fee schedule propagated to newly created expiration books.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl ExpirationOrderBookManager {
@@ -240,6 +257,7 @@ impl ExpirationOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: None,
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -264,6 +282,7 @@ impl ExpirationOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -307,6 +326,20 @@ impl ExpirationOrderBookManager {
     #[must_use]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future expiration books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -353,6 +386,9 @@ impl ExpirationOrderBookManager {
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
             book.set_stp_mode(stp);
+        }
+        if let Some(schedule) = self.fee_schedule.get() {
+            book.set_fee_schedule(schedule);
         }
         self.expirations.insert(expiration, Arc::clone(&book));
         book
