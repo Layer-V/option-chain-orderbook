@@ -5,13 +5,14 @@
 
 use super::contract_specs::ContractSpecs;
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
+use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::STPMode;
+use orderbook_rs::{FeeSchedule, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single underlying asset.
@@ -33,8 +34,6 @@ pub struct UnderlyingOrderBook {
     /// Expiration order book manager.
     expirations: ExpirationOrderBookManager,
     /// Instrument registry propagated to expiration managers.
-    /// Stored to keep the `Arc` reference alive for the hierarchy.
-    #[allow(dead_code)]
     registry: Option<Arc<InstrumentRegistry>>,
 }
 
@@ -93,6 +92,12 @@ impl UnderlyingOrderBook {
         &self.expirations
     }
 
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
+    }
+
     /// Sets the contract specifications for this underlying.
     ///
     /// Automatically derives and applies a [`ValidationConfig`] from the specs'
@@ -134,14 +139,42 @@ impl UnderlyingOrderBook {
     ///
     /// Delegates to [`ExpirationOrderBookManager::set_stp_mode`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.expirations.set_stp_mode(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.expirations.stp_mode()
+    }
+
+    /// Sets the fee schedule for future expirations created within this underlying.
+    ///
+    /// Only expirations created after this call (via the internal
+    /// [`ExpirationOrderBookManager`]) inherit the schedule. Existing
+    /// expirations and their strikes are not affected.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.expirations.set_fee_schedule(schedule);
+    }
+
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.expirations.clear_fee_schedule();
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.expirations.fee_schedule()
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.
@@ -241,6 +274,8 @@ pub struct UnderlyingOrderBookManager {
     registry: Arc<InstrumentRegistry>,
     /// STP mode propagated to newly created underlying books.
     stp_mode: SharedSTPMode,
+    /// Fee schedule propagated to newly created underlying books.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl Default for UnderlyingOrderBookManager {
@@ -261,6 +296,7 @@ impl UnderlyingOrderBookManager {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new()),
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -279,6 +315,7 @@ impl UnderlyingOrderBookManager {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new_with_seed(seed)),
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -312,6 +349,9 @@ impl UnderlyingOrderBookManager {
         if stp != STPMode::None {
             book.set_stp_mode(stp);
         }
+        if let Some(schedule) = self.fee_schedule.get() {
+            book.set_fee_schedule(schedule);
+        }
         self.underlyings.insert(underlying, Arc::clone(&book));
         book
     }
@@ -320,14 +360,41 @@ impl UnderlyingOrderBookManager {
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future underlying books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future underlying books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
     }
 
     /// Gets an underlying order book.
@@ -1274,5 +1341,178 @@ mod tests {
             .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, other_user)
             .unwrap();
         assert_eq!(strike.call().order_count(), 0);
+    }
+
+    // ── Fee schedule tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_underlying_fee_schedule_default_is_none() {
+        let book = UnderlyingOrderBook::new("BTC");
+        assert!(book.fee_schedule().is_none());
+    }
+
+    #[test]
+    fn test_underlying_set_fee_schedule() {
+        let book = UnderlyingOrderBook::new("BTC");
+        book.set_fee_schedule(FeeSchedule::new(-2, 5));
+        let fs = book.fee_schedule();
+        assert!(fs.is_some());
+        let s = fs.unwrap();
+        assert_eq!(s.maker_fee_bps, -2);
+        assert_eq!(s.taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_underlying_fee_propagates_to_new_strikes() {
+        let book = UnderlyingOrderBook::new("BTC");
+        book.set_fee_schedule(FeeSchedule::new(-2, 5));
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        let call_fs = strike.call().fee_schedule();
+        assert!(call_fs.is_some());
+        let s = call_fs.unwrap();
+        assert_eq!(s.maker_fee_bps, -2);
+        assert_eq!(s.taker_fee_bps, 5);
+
+        let put_fs = strike.put().fee_schedule();
+        assert!(put_fs.is_some());
+        let s = put_fs.unwrap();
+        assert_eq!(s.maker_fee_bps, -2);
+        assert_eq!(s.taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_underlying_fee_existing_expiration_unaffected() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        // Create expiration BEFORE setting fee schedule
+        let exp_before = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
+
+        book.set_fee_schedule(FeeSchedule::new(-2, 5));
+
+        // Existing expiration's new strikes do NOT get fee schedule
+        let strike_old = exp_before.get_or_create_strike(50000);
+        assert!(strike_old.call().fee_schedule().is_none());
+
+        // New expiration DOES get fee schedule
+        let exp_after = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let strike_new = exp_after.get_or_create_strike(50000);
+        let fs = strike_new.call().fee_schedule();
+        assert!(fs.is_some());
+        assert_eq!(fs.unwrap().taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_manager_fee_schedule_propagates_through_full_hierarchy() {
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_fee_schedule(FeeSchedule::new(-3, 8));
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        let call_fs = strike.call().fee_schedule().unwrap();
+        assert_eq!(call_fs.maker_fee_bps, -3);
+        assert_eq!(call_fs.taker_fee_bps, 8);
+
+        let put_fs = strike.put().fee_schedule().unwrap();
+        assert_eq!(put_fs.maker_fee_bps, -3);
+        assert_eq!(put_fs.taker_fee_bps, 8);
+    }
+
+    #[test]
+    fn test_manager_fee_schedule_default_is_none() {
+        let manager = UnderlyingOrderBookManager::new();
+        assert!(manager.fee_schedule().is_none());
+    }
+
+    #[test]
+    fn test_manager_fee_existing_underlying_unaffected() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        // Create underlying BEFORE setting fee schedule
+        let btc = manager.get_or_create("BTC");
+
+        manager.set_fee_schedule(FeeSchedule::new(-2, 5));
+
+        // Existing underlying's new expirations do NOT get fee schedule
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert!(strike.call().fee_schedule().is_none());
+
+        // New underlying DOES get fee schedule
+        let eth = manager.get_or_create("ETH");
+        let exp2 = eth.get_or_create_expiration(test_expiration());
+        let strike2 = exp2.get_or_create_strike(50000);
+        assert_eq!(strike2.call().fee_schedule().unwrap().taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_different_fee_schedules_per_underlying() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        btc.set_fee_schedule(FeeSchedule::new(-1, 3));
+
+        let eth = manager.get_or_create("ETH");
+        eth.set_fee_schedule(FeeSchedule::new(-5, 10));
+
+        let btc_exp = btc.get_or_create_expiration(test_expiration());
+        let btc_strike = btc_exp.get_or_create_strike(50000);
+
+        let eth_exp = eth.get_or_create_expiration(test_expiration());
+        let eth_strike = eth_exp.get_or_create_strike(3000);
+
+        let btc_fs = btc_strike.call().fee_schedule().unwrap();
+        assert_eq!(btc_fs.maker_fee_bps, -1);
+        assert_eq!(btc_fs.taker_fee_bps, 3);
+
+        let eth_fs = eth_strike.call().fee_schedule().unwrap();
+        assert_eq!(eth_fs.maker_fee_bps, -5);
+        assert_eq!(eth_fs.taker_fee_bps, 10);
+    }
+
+    #[test]
+    fn test_fee_schedule_coexists_with_stp() {
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_stp_mode(STPMode::CancelTaker);
+        manager.set_fee_schedule(FeeSchedule::new(-2, 5));
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        assert_eq!(strike.call().stp_mode(), STPMode::CancelTaker);
+        let fs = strike.call().fee_schedule().unwrap();
+        assert_eq!(fs.maker_fee_bps, -2);
+        assert_eq!(fs.taker_fee_bps, 5);
+    }
+
+    #[test]
+    fn test_fee_full_order_through_hierarchy() {
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_fee_schedule(FeeSchedule::new(0, 5));
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        // Place resting sell, then aggressive buy via _full
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .unwrap();
+
+        let result = strike
+            .call()
+            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+
+        // Trade executed
+        assert_eq!(strike.call().order_count(), 0);
+        // Result should have the correct symbol
+        assert!(result.symbol.contains("BTC"));
     }
 }

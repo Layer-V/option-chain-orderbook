@@ -4,6 +4,7 @@
 //! for managing all strikes within a single expiration.
 
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
@@ -11,7 +12,7 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, OrderId, STPMode};
 use std::sync::Arc;
 
 /// Option chain order book for a single expiration.
@@ -37,8 +38,6 @@ pub struct OptionChainOrderBook {
     /// Unique identifier for this option chain order book.
     id: OrderId,
     /// Instrument registry propagated to strike managers.
-    /// Stored to keep the `Arc` reference alive for the hierarchy.
-    #[allow(dead_code)]
     registry: Option<Arc<InstrumentRegistry>>,
 }
 
@@ -117,6 +116,12 @@ impl OptionChainOrderBook {
         &self.strikes
     }
 
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
+    }
+
     /// Returns an Arc reference to the strike manager.
     #[must_use]
     pub fn strikes_arc(&self) -> Arc<StrikeOrderBookManager> {
@@ -156,14 +161,41 @@ impl OptionChainOrderBook {
     ///
     /// Delegates to the underlying [`StrikeOrderBookManager::set_stp_mode`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.strikes.set_stp_mode(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.strikes.stp_mode()
+    }
+
+    /// Sets the fee schedule for all future option books created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.strikes.set_fee_schedule(schedule);
+    }
+
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.strikes.clear_fee_schedule();
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.strikes.fee_schedule()
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -260,6 +292,8 @@ pub struct OptionChainOrderBookManager {
     registry: Option<Arc<InstrumentRegistry>>,
     /// STP mode propagated to newly created chains.
     stp_mode: SharedSTPMode,
+    /// Fee schedule propagated to newly created chains.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl OptionChainOrderBookManager {
@@ -277,6 +311,7 @@ impl OptionChainOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: None,
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -302,6 +337,7 @@ impl OptionChainOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -337,14 +373,41 @@ impl OptionChainOrderBookManager {
     ///
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future chains have no fees configured.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -391,6 +454,9 @@ impl OptionChainOrderBookManager {
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
             chain.set_stp_mode(stp);
+        }
+        if let Some(schedule) = self.fee_schedule.get() {
+            chain.set_fee_schedule(schedule);
         }
         self.chains.insert(expiration, Arc::clone(&chain));
         chain

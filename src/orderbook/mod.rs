@@ -51,6 +51,7 @@ mod book;
 mod chain;
 mod contract_specs;
 mod expiration;
+mod fees;
 mod instrument_registry;
 mod instrument_status;
 mod quote;
@@ -73,6 +74,6 @@ pub use underlying::{
 };
 pub use validation::ValidationConfig;
 
-// Re-export upstream types used in the STP API
-pub use orderbook_rs::STPMode;
+// Re-export upstream types used in the public API
+pub use orderbook_rs::{FeeSchedule, STPMode, TradeResult};
 pub use pricelevel::Hash32;

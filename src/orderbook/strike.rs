@@ -3,8 +3,9 @@
 //! This module provides the [`StrikeOrderBook`] and [`StrikeOrderBookManager`]
 //! for managing call/put pairs at a specific strike price.
 
-use super::book::OptionOrderBook;
+use super::book::{BookConfig, OptionOrderBook};
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
 use super::stp::SharedSTPMode;
@@ -14,7 +15,7 @@ use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, OrderId, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single strike price containing both call and put.
@@ -185,6 +186,16 @@ impl StrikeOrderBook {
         self.call.stp_mode()
     }
 
+    /// Returns the fee schedule configured on the call book.
+    ///
+    /// Both call and put books share the same fee schedule when created
+    /// through the hierarchy, so reading from the call book is sufficient.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.call.fee_schedule()
+    }
+
     /// Returns a reference to the call order book.
     #[must_use]
     pub fn call(&self) -> &OptionOrderBook {
@@ -305,6 +316,8 @@ pub struct StrikeOrderBookManager {
     registry: Option<Arc<InstrumentRegistry>>,
     /// STP mode applied to newly created option books.
     stp_mode: SharedSTPMode,
+    /// Fee schedule applied to newly created option books.
+    fee_schedule: SharedFeeSchedule,
 }
 
 impl StrikeOrderBookManager {
@@ -324,6 +337,7 @@ impl StrikeOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: None,
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -351,6 +365,7 @@ impl StrikeOrderBookManager {
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
             stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
         }
     }
 
@@ -394,14 +409,41 @@ impl StrikeOrderBookManager {
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will use this mode.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
+    }
+
+    /// Sets the fee schedule for all future strike books.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will use this schedule.
+    #[inline]
+    pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
+        self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future strike books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
+    /// Returns the current fee schedule, or `None` if no fees are configured.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> Option<FeeSchedule> {
+        self.fee_schedule.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -463,7 +505,8 @@ impl StrikeOrderBookManager {
     }
 
     /// Internal helper that builds a [`StrikeOrderBook`] with optional
-    /// validation config and STP mode but **without** allocating instrument IDs.
+    /// validation config, STP mode, and fee schedule but **without** allocating
+    /// instrument IDs.
     ///
     /// IDs are assigned later by [`assign_instrument_ids`](Self::assign_instrument_ids)
     /// only after confirming the book won the insertion race.
@@ -473,58 +516,23 @@ impl StrikeOrderBookManager {
         let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
         let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
 
-        let validation = self.validation_config.get();
-        let stp = self.stp_mode.get();
-        let has_stp = stp != STPMode::None;
-
-        let (call, put) = match (&validation, has_stp) {
-            (Some(config), true) => {
-                let call = Arc::new(OptionOrderBook::new_with_validation_and_stp(
-                    &call_symbol,
-                    OptionStyle::Call,
-                    config,
-                    stp,
-                ));
-                let put = Arc::new(OptionOrderBook::new_with_validation_and_stp(
-                    &put_symbol,
-                    OptionStyle::Put,
-                    config,
-                    stp,
-                ));
-                (call, put)
-            }
-            (Some(config), false) => {
-                let call = Arc::new(OptionOrderBook::new_with_validation(
-                    &call_symbol,
-                    OptionStyle::Call,
-                    config,
-                ));
-                let put = Arc::new(OptionOrderBook::new_with_validation(
-                    &put_symbol,
-                    OptionStyle::Put,
-                    config,
-                ));
-                (call, put)
-            }
-            (None, true) => {
-                let call = Arc::new(OptionOrderBook::new_with_stp(
-                    &call_symbol,
-                    OptionStyle::Call,
-                    stp,
-                ));
-                let put = Arc::new(OptionOrderBook::new_with_stp(
-                    &put_symbol,
-                    OptionStyle::Put,
-                    stp,
-                ));
-                (call, put)
-            }
-            (None, false) => {
-                let call = Arc::new(OptionOrderBook::new(&call_symbol, OptionStyle::Call));
-                let put = Arc::new(OptionOrderBook::new(&put_symbol, OptionStyle::Put));
-                (call, put)
-            }
+        let base_config = BookConfig {
+            validation: self.validation_config.get(),
+            stp_mode: self.stp_mode.get(),
+            fee_schedule: self.fee_schedule.get(),
+            ..BookConfig::default()
         };
+
+        let call = Arc::new(OptionOrderBook::new_with_config(
+            &call_symbol,
+            OptionStyle::Call,
+            base_config.clone(),
+        ));
+        let put = Arc::new(OptionOrderBook::new_with_config(
+            &put_symbol,
+            OptionStyle::Put,
+            base_config,
+        ));
 
         Arc::new(StrikeOrderBook::from_books(
             &self.underlying,
