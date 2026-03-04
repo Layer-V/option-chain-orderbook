@@ -73,8 +73,8 @@ fn main() {
         info!(
             "  Level {}: price={}, size={}",
             i + 1,
-            level.price,
-            level.visible_quantity
+            level.price(),
+            level.visible_quantity()
         );
     }
     info!("Asks:");
@@ -82,8 +82,8 @@ fn main() {
         info!(
             "  Level {}: price={}, size={}",
             i + 1,
-            level.price,
-            level.visible_quantity
+            level.price(),
+            level.visible_quantity()
         );
     }
 

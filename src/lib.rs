@@ -202,10 +202,10 @@
 //!
 //! ## Dependencies
 //!
-//! - **orderbook-rs** (0.4): Lock-free order book engine
-//! - **optionstratlib** (0.13): Options pricing, Greeks, and strategy analysis
+//! - **orderbook-rs** (0.6): Lock-free order book engine
+//! - **optionstratlib** (0.15): Options pricing, Greeks, and strategy analysis
 //! - **dashmap** (6.1): Concurrent hash map for thread-safe access
-//! - **rust_decimal** (1.39): Precise decimal arithmetic
+//! - **rust_decimal** (1.40): Precise decimal arithmetic
 //! - **thiserror** (2.0): Error handling
 //! - **serde** (1.0): Serialization support
 

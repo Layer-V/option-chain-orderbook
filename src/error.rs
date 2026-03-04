@@ -146,6 +146,10 @@ pub enum Error {
     /// Error from optionstratlib decimal operations.
     #[error("optionstratlib decimal error: {0}")]
     OptionStratLibDecimal(#[from] optionstratlib::error::decimal::DecimalError),
+
+    /// Error from expiration date operations.
+    #[error("expiration date error: {0}")]
+    ExpirationDateError(#[from] optionstratlib::model::ExpirationDateError),
 }
 
 impl Error {
