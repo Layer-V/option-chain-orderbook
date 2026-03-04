@@ -34,8 +34,6 @@ pub struct UnderlyingOrderBook {
     /// Expiration order book manager.
     expirations: ExpirationOrderBookManager,
     /// Instrument registry propagated to expiration managers.
-    /// Stored to keep the `Arc` reference alive for the hierarchy.
-    #[allow(dead_code)]
     registry: Option<Arc<InstrumentRegistry>>,
 }
 
@@ -92,6 +90,12 @@ impl UnderlyingOrderBook {
     #[must_use]
     pub const fn expirations(&self) -> &ExpirationOrderBookManager {
         &self.expirations
+    }
+
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
     }
 
     /// Sets the contract specifications for this underlying.

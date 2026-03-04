@@ -38,8 +38,6 @@ pub struct ExpirationOrderBook {
     /// Unique identifier for this expiration order book.
     id: OrderId,
     /// Instrument registry propagated to the chain.
-    /// Stored to keep the `Arc` reference alive for the hierarchy.
-    #[allow(dead_code)]
     registry: Option<Arc<InstrumentRegistry>>,
 }
 
@@ -116,6 +114,12 @@ impl ExpirationOrderBook {
     #[must_use]
     pub fn chain(&self) -> &OptionChainOrderBook {
         &self.chain
+    }
+
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
     }
 
     /// Returns an Arc reference to the option chain.

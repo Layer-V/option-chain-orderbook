@@ -38,8 +38,6 @@ pub struct OptionChainOrderBook {
     /// Unique identifier for this option chain order book.
     id: OrderId,
     /// Instrument registry propagated to strike managers.
-    /// Stored to keep the `Arc` reference alive for the hierarchy.
-    #[allow(dead_code)]
     registry: Option<Arc<InstrumentRegistry>>,
 }
 
@@ -116,6 +114,12 @@ impl OptionChainOrderBook {
     #[must_use]
     pub fn strikes(&self) -> &StrikeOrderBookManager {
         &self.strikes
+    }
+
+    /// Returns a reference to the instrument registry, if any.
+    #[must_use]
+    pub fn registry(&self) -> Option<&Arc<InstrumentRegistry>> {
+        self.registry.as_ref()
     }
 
     /// Returns an Arc reference to the strike manager.
