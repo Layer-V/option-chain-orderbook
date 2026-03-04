@@ -6,10 +6,12 @@
 use super::contract_specs::ContractSpecs;
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
+use super::stp::SharedSTPMode;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
+use orderbook_rs::STPMode;
 use std::sync::Arc;
 
 /// Order book for a single underlying asset.
@@ -128,6 +130,20 @@ impl UnderlyingOrderBook {
         self.expirations.validation_config()
     }
 
+    /// Sets the STP mode for all future option books created within this underlying.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_stp_mode`].
+    /// Existing books are not affected.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.expirations.set_stp_mode(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.expirations.stp_mode()
+    }
+
     /// Gets or creates an expiration order book, returning an Arc reference.
     pub fn get_or_create_expiration(&self, expiration: ExpirationDate) -> Arc<ExpirationOrderBook> {
         self.expirations.get_or_create(expiration)
@@ -223,6 +239,8 @@ pub struct UnderlyingOrderBookManager {
     underlyings: SkipMap<String, Arc<UnderlyingOrderBook>>,
     /// Shared instrument registry for allocating unique IDs.
     registry: Arc<InstrumentRegistry>,
+    /// STP mode propagated to newly created underlying books.
+    stp_mode: SharedSTPMode,
 }
 
 impl Default for UnderlyingOrderBookManager {
@@ -242,6 +260,7 @@ impl UnderlyingOrderBookManager {
         Self {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new()),
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -259,6 +278,7 @@ impl UnderlyingOrderBookManager {
         Self {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new_with_seed(seed)),
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -288,8 +308,26 @@ impl UnderlyingOrderBookManager {
             &underlying,
             Arc::clone(&self.registry),
         ));
+        let stp = self.stp_mode.get();
+        if stp != STPMode::None {
+            book.set_stp_mode(stp);
+        }
         self.underlyings.insert(underlying, Arc::clone(&book));
         book
+    }
+
+    /// Sets the STP mode for all future underlying books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
     }
 
     /// Gets an underlying order book.
@@ -1115,5 +1153,126 @@ mod tests {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         assert_eq!(strike.call().instrument_id(), 0);
         assert_eq!(strike.put().instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_underlying_stp_default_is_none() {
+        let book = UnderlyingOrderBook::new("BTC");
+        assert_eq!(book.stp_mode(), STPMode::None);
+    }
+
+    #[test]
+    fn test_underlying_set_stp_mode() {
+        let book = UnderlyingOrderBook::new("BTC");
+        book.set_stp_mode(STPMode::CancelTaker);
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+    }
+
+    #[test]
+    fn test_underlying_stp_propagates_to_new_strikes() {
+        let book = UnderlyingOrderBook::new("BTC");
+        book.set_stp_mode(STPMode::CancelTaker);
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        assert_eq!(strike.call().stp_mode(), STPMode::CancelTaker);
+        assert_eq!(strike.put().stp_mode(), STPMode::CancelTaker);
+        assert_eq!(strike.stp_mode(), STPMode::CancelTaker);
+    }
+
+    #[test]
+    fn test_underlying_stp_existing_expiration_unaffected() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        // Create expiration BEFORE setting STP
+        let exp_before = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(30.0)));
+
+        // Set STP mode
+        book.set_stp_mode(STPMode::CancelBoth);
+
+        // Existing expiration's new strikes do NOT get STP
+        let strike_old = exp_before.get_or_create_strike(50000);
+        assert_eq!(strike_old.call().stp_mode(), STPMode::None);
+
+        // New expiration DOES get STP
+        let exp_after = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let strike_new = exp_after.get_or_create_strike(50000);
+        assert_eq!(strike_new.call().stp_mode(), STPMode::CancelBoth);
+    }
+
+    #[test]
+    fn test_manager_stp_propagates_through_full_hierarchy() {
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_stp_mode(STPMode::CancelTaker);
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        assert_eq!(strike.call().stp_mode(), STPMode::CancelTaker);
+        assert_eq!(strike.put().stp_mode(), STPMode::CancelTaker);
+    }
+
+    #[test]
+    fn test_manager_stp_default_is_none() {
+        let manager = UnderlyingOrderBookManager::new();
+        assert_eq!(manager.stp_mode(), STPMode::None);
+    }
+
+    #[test]
+    fn test_manager_stp_existing_underlying_unaffected() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        // Create underlying BEFORE setting STP
+        let btc = manager.get_or_create("BTC");
+
+        manager.set_stp_mode(STPMode::CancelBoth);
+
+        // Existing underlying's new expirations do NOT get STP
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert_eq!(strike.call().stp_mode(), STPMode::None);
+
+        // New underlying DOES get STP
+        let eth = manager.get_or_create("ETH");
+        let exp2 = eth.get_or_create_expiration(test_expiration());
+        let strike2 = exp2.get_or_create_strike(50000);
+        assert_eq!(strike2.call().stp_mode(), STPMode::CancelBoth);
+    }
+
+    #[test]
+    fn test_stp_prevents_self_trade_through_hierarchy() {
+        use pricelevel::Hash32;
+
+        let manager = UnderlyingOrderBookManager::new();
+        manager.set_stp_mode(STPMode::CancelTaker);
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order on the call book
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+
+        // Same user places a crossing buy — STP triggers
+        let result =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+
+        // Different user trades normally
+        let other_user = Hash32::from([2u8; 32]);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, other_user)
+            .unwrap();
+        assert_eq!(strike.call().order_count(), 0);
     }
 }
