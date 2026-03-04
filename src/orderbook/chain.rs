@@ -34,8 +34,6 @@ pub struct OptionChainOrderBook {
     strikes: Arc<StrikeOrderBookManager>,
     /// Unique identifier for this option chain order book.
     id: OrderId,
-    /// Contract specifications inherited from the underlying.
-    contract_specs: SharedContractSpecs,
 }
 
 impl OptionChainOrderBook {
@@ -54,7 +52,6 @@ impl OptionChainOrderBook {
             underlying,
             expiration,
             id: OrderId::new(),
-            contract_specs: SharedContractSpecs::new(),
         }
     }
 
@@ -92,14 +89,15 @@ impl OptionChainOrderBook {
     ///
     /// Also propagates the specs to the strike manager for newly created strikes.
     pub fn set_specs(&self, specs: ContractSpecs) {
-        self.strikes.set_specs(specs.clone());
-        self.contract_specs.set(specs);
+        self.strikes.set_specs(specs);
     }
 
     /// Returns the current contract specifications, if any.
+    ///
+    /// Delegates to the strike manager to maintain a single source of truth.
     #[must_use]
     pub fn specs(&self) -> Option<ContractSpecs> {
-        self.contract_specs.get()
+        self.strikes.specs()
     }
 
     /// Sets the validation config for all future strikes created within this chain.

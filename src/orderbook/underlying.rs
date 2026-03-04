@@ -3,7 +3,7 @@
 //! This module provides the [`UnderlyingOrderBook`] and [`UnderlyingOrderBookManager`]
 //! for managing all underlyings in the system.
 
-use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::contract_specs::ContractSpecs;
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
@@ -29,8 +29,6 @@ pub struct UnderlyingOrderBook {
     underlying: String,
     /// Expiration order book manager.
     expirations: ExpirationOrderBookManager,
-    /// Contract specifications for this underlying.
-    specs: SharedContractSpecs,
 }
 
 impl UnderlyingOrderBook {
@@ -46,7 +44,6 @@ impl UnderlyingOrderBook {
         Self {
             expirations: ExpirationOrderBookManager::new(&underlying),
             underlying,
-            specs: SharedContractSpecs::new(),
         }
     }
 
@@ -72,15 +69,16 @@ impl UnderlyingOrderBook {
     /// validation config.
     pub fn set_specs(&self, specs: ContractSpecs) {
         let validation = specs.to_validation_config();
-        self.expirations.set_specs(specs.clone());
-        self.specs.set(specs);
+        self.expirations.set_specs(specs);
         self.expirations.set_validation(validation);
     }
 
     /// Returns the current contract specifications, if any.
+    ///
+    /// Delegates to the expiration manager to maintain a single source of truth.
     #[must_use]
     pub fn specs(&self) -> Option<ContractSpecs> {
-        self.specs.get()
+        self.expirations.specs()
     }
 
     /// Sets the validation config for all future expirations and strikes

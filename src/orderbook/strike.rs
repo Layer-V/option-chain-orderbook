@@ -284,10 +284,11 @@ impl StrikeOrderBookManager {
         }
     }
 
-    /// Sets the contract specs for all future strike books created by this manager.
+    /// Sets the contract specs associated with this manager.
     ///
-    /// Existing strike books are not affected. Only newly created books
-    /// via [`get_or_create`](Self::get_or_create) will have these specs.
+    /// These specs are stored on the manager and can be retrieved later
+    /// via [`specs`](Self::specs). This does not modify any existing
+    /// strike books or automatically apply to newly created ones.
     pub fn set_specs(&self, specs: ContractSpecs) {
         self.contract_specs.set(specs);
     }
