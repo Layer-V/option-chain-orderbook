@@ -4,6 +4,7 @@
 //! for managing all underlyings in the system.
 
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
+use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
@@ -55,6 +56,21 @@ impl UnderlyingOrderBook {
     #[must_use]
     pub const fn expirations(&self) -> &ExpirationOrderBookManager {
         &self.expirations
+    }
+
+    /// Sets the validation config for all future expirations and strikes
+    /// created within this underlying.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::set_validation`].
+    /// Existing expiration books and strikes are not affected.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.expirations.set_validation(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.expirations.validation_config()
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.
@@ -503,5 +519,100 @@ mod tests {
         assert!(display.contains("1 underlyings"));
         assert!(display.contains("1 expirations"));
         assert!(display.contains("1 strikes"));
+    }
+
+    #[test]
+    fn test_underlying_set_validation() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let config = ValidationConfig::new().with_tick_size(100);
+        book.set_validation(config.clone());
+
+        assert_eq!(book.validation_config(), Some(config));
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_underlying_set_validation_full_hierarchy() {
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+
+        let config = ValidationConfig::new()
+            .with_tick_size(100)
+            .with_lot_size(10)
+            .with_min_order_size(5)
+            .with_max_order_size(1000);
+        btc.set_validation(config);
+
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        // Valid: price=200 (tick 100), qty=20 (lot 10, range 5..1000)
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 20)
+                .is_ok()
+        );
+
+        // Invalid tick
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 20)
+                .is_err()
+        );
+
+        // Invalid lot
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 15)
+                .is_err()
+        );
+
+        // Too small
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 2)
+                .is_err()
+        );
+
+        // Too large
+        assert!(
+            strike
+                .put()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 2000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_underlying_no_validation_by_default() {
+        let book = UnderlyingOrderBook::new("BTC");
+        assert!(book.validation_config().is_none());
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_ok()
+        );
     }
 }
