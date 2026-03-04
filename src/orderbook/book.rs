@@ -111,9 +111,10 @@ impl OptionOrderBook {
         }
     }
 
-    /// Returns the current validation configuration read back from the underlying book.
+    /// Returns the current validation configuration read back from the underlying book,
+    /// or `None` if no validation rules are configured.
     #[must_use]
-    pub fn validation_config(&self) -> ValidationConfig {
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
         let mut config = ValidationConfig::new();
         if let Some(tick) = self.book.tick_size() {
             config = config.with_tick_size(tick);
@@ -127,7 +128,11 @@ impl OptionOrderBook {
         if let Some(max) = self.book.max_order_size() {
             config = config.with_max_order_size(max);
         }
-        config
+        if config.is_empty() {
+            None
+        } else {
+            Some(config)
+        }
     }
 
     /// Returns the option style (Call or Put).
@@ -767,14 +772,13 @@ mod tests {
         );
 
         let readback = book.validation_config();
-        assert_eq!(readback, config);
+        assert_eq!(readback, Some(config));
     }
 
     #[test]
     fn test_no_validation_by_default() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        let config = book.validation_config();
-        assert!(config.is_empty());
+        assert!(book.validation_config().is_none());
 
         // Any price/quantity should work
         assert!(
