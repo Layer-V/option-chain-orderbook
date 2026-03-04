@@ -5,6 +5,7 @@
 
 use super::chain::OptionChainOrderBook;
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::instrument_registry::InstrumentRegistry;
 use super::strike::StrikeOrderBook;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
@@ -34,6 +35,10 @@ pub struct ExpirationOrderBook {
     chain: Arc<OptionChainOrderBook>,
     /// Unique identifier for this expiration order book.
     id: OrderId,
+    /// Instrument registry propagated to the chain.
+    /// Stored to keep the `Arc` reference alive for the hierarchy.
+    #[allow(dead_code)]
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl ExpirationOrderBook {
@@ -52,6 +57,38 @@ impl ExpirationOrderBook {
             underlying,
             expiration,
             id: OrderId::new(),
+            registry: None,
+        }
+    }
+
+    /// Creates a new expiration order book with an instrument registry.
+    ///
+    /// The registry is propagated to the internal [`OptionChainOrderBook`]
+    /// and its strike manager.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            chain: Arc::new(OptionChainOrderBook::new_with_registry(
+                &underlying,
+                expiration,
+                Arc::clone(&registry),
+            )),
+            underlying,
+            expiration,
+            id: OrderId::new(),
+            registry: Some(registry),
         }
     }
 
@@ -167,6 +204,8 @@ pub struct ExpirationOrderBookManager {
     validation_config: SharedValidationConfig,
     /// Contract specs propagated to newly created expiration books.
     contract_specs: SharedContractSpecs,
+    /// Instrument registry propagated to newly created expiration books.
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl ExpirationOrderBookManager {
@@ -182,6 +221,30 @@ impl ExpirationOrderBookManager {
             underlying: underlying.into(),
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
+            registry: None,
+        }
+    }
+
+    /// Creates a new expiration order book manager with an instrument registry.
+    ///
+    /// The registry is propagated to newly created expiration books and
+    /// their chains.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        Self {
+            expirations: SkipMap::new(),
+            underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
         }
     }
 
@@ -239,7 +302,15 @@ impl ExpirationOrderBookManager {
         if let Some(entry) = self.expirations.get(&expiration) {
             return Arc::clone(entry.value());
         }
-        let book = Arc::new(ExpirationOrderBook::new(&self.underlying, expiration));
+        let book = if let Some(ref reg) = self.registry {
+            Arc::new(ExpirationOrderBook::new_with_registry(
+                &self.underlying,
+                expiration,
+                Arc::clone(reg),
+            ))
+        } else {
+            Arc::new(ExpirationOrderBook::new(&self.underlying, expiration))
+        };
         if let Some(ref config) = self.validation_config.get() {
             book.set_validation(config.clone());
         }
