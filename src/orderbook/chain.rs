@@ -182,6 +182,15 @@ impl OptionChainOrderBook {
         self.strikes.set_fee_schedule(schedule);
     }
 
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.strikes.clear_fee_schedule();
+    }
+
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
     #[inline]
@@ -383,6 +392,15 @@ impl OptionChainOrderBookManager {
     #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future chains have no fees configured.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.

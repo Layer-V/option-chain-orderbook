@@ -175,6 +175,15 @@ impl ExpirationOrderBook {
         self.chain.set_fee_schedule(schedule);
     }
 
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.chain.clear_fee_schedule();
+    }
+
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
     #[inline]
@@ -345,6 +354,15 @@ impl ExpirationOrderBookManager {
     #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future expiration books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.

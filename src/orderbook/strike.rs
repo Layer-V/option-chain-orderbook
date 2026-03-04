@@ -430,6 +430,15 @@ impl StrikeOrderBookManager {
         self.fee_schedule.set(Some(schedule));
     }
 
+    /// Clears the fee schedule so future strike books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
+    }
+
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
     #[inline]

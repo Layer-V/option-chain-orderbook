@@ -151,13 +151,23 @@ impl UnderlyingOrderBook {
         self.expirations.stp_mode()
     }
 
-    /// Sets the fee schedule for all future option books created within this underlying.
+    /// Sets the fee schedule for future expirations created within this underlying.
     ///
-    /// Delegates to [`ExpirationOrderBookManager::set_fee_schedule`].
-    /// Existing books are not affected.
+    /// Only expirations created after this call (via the internal
+    /// [`ExpirationOrderBookManager`]) inherit the schedule. Existing
+    /// expirations and their strikes are not affected.
     #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.expirations.set_fee_schedule(schedule);
+    }
+
+    /// Clears the fee schedule so future option books have no fees configured.
+    ///
+    /// Delegates to [`ExpirationOrderBookManager::clear_fee_schedule`].
+    /// Existing books are not affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.expirations.clear_fee_schedule();
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
@@ -369,6 +379,15 @@ impl UnderlyingOrderBookManager {
     #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
+    }
+
+    /// Clears the fee schedule so future underlying books have no fees configured.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will be affected.
+    #[inline]
+    pub fn clear_fee_schedule(&self) {
+        self.fee_schedule.set(None);
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.

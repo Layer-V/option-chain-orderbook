@@ -115,9 +115,10 @@ impl OptionOrderBook {
         let capture: Arc<Mutex<Option<TradeResult>>> = Arc::new(Mutex::new(None));
         let capture_clone = Arc::clone(&capture);
         book.set_trade_listener(Arc::new(move |tr: &TradeResult| {
-            if let Ok(mut guard) = capture_clone.lock() {
-                *guard = Some(tr.clone());
-            }
+            let mut guard = capture_clone
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(tr.clone());
         }));
 
         Self {
@@ -358,8 +359,8 @@ impl OptionOrderBook {
     pub fn last_trade_result(&self) -> Option<TradeResult> {
         self.last_trade_result
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Returns the current lifecycle status of this instrument.
@@ -419,10 +420,7 @@ impl OptionOrderBook {
         if current.is_accepting_orders() {
             Ok(())
         } else {
-            Err(crate::Error::instrument_not_active(
-                &self.symbol,
-                current,
-            ))
+            Err(crate::Error::instrument_not_active(&self.symbol, current))
         }
     }
 
@@ -562,9 +560,11 @@ impl OptionOrderBook {
 
     /// Clears the captured trade result before submitting an order.
     fn clear_trade_capture(&self) {
-        if let Ok(mut guard) = self.last_trade_result.lock() {
-            *guard = None;
-        }
+        let mut guard = self
+            .last_trade_result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
     }
 
     /// Extracts the captured [`TradeResult`], or creates an empty one
@@ -573,8 +573,8 @@ impl OptionOrderBook {
     fn extract_trade_result(&self, order_id: OrderId, quantity: u64) -> TradeResult {
         self.last_trade_result
             .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
             .unwrap_or_else(|| {
                 TradeResult::new(self.symbol.clone(), MatchResult::new(order_id, quantity))
             })
