@@ -48,6 +48,8 @@ pub struct OptionOrderBook {
     id: OrderId,
     /// Lifecycle status of this instrument, stored as atomic u8.
     status: AtomicU8,
+    /// Numeric instrument ID for fast lookups and compact wire representation.
+    instrument_id: u32,
 }
 
 impl OptionOrderBook {
@@ -70,6 +72,38 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: 0,
+        }
+    }
+
+    /// Creates a new option order book with a pre-assigned instrument ID.
+    ///
+    /// Used internally by the hierarchy when an [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry)
+    /// is available.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `instrument_id` - The unique numeric instrument ID
+    #[must_use]
+    pub(crate) fn new_with_id(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        instrument_id: u32,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+
+        Self {
+            symbol: symbol.clone(),
+            symbol_hash,
+            book: Arc::new(DefaultOrderBook::new(&symbol)),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id,
         }
     }
 
@@ -114,6 +148,56 @@ impl OptionOrderBook {
             option_style,
             id: OrderId::new(),
             status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: 0,
+        }
+    }
+
+    /// Creates a new option order book with a pre-assigned instrument ID and
+    /// pre-trade validation configured.
+    ///
+    /// Used internally by the hierarchy when both an
+    /// [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry)
+    /// and a [`ValidationConfig`] are available.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `instrument_id` - The unique numeric instrument ID
+    /// * `config` - Validation configuration
+    #[must_use]
+    pub(crate) fn new_with_id_and_validation(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        instrument_id: u32,
+        config: &ValidationConfig,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+        let mut book = DefaultOrderBook::new(&symbol);
+
+        if let Some(tick) = config.tick_size() {
+            book.set_tick_size(tick);
+        }
+        if let Some(lot) = config.lot_size() {
+            book.set_lot_size(lot);
+        }
+        if let Some(min) = config.min_order_size() {
+            book.set_min_order_size(min);
+        }
+        if let Some(max) = config.max_order_size() {
+            book.set_max_order_size(max);
+        }
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id,
         }
     }
 
@@ -182,6 +266,17 @@ impl OptionOrderBook {
     #[must_use]
     pub fn inner_arc(&self) -> Arc<DefaultOrderBook> {
         Arc::clone(&self.book)
+    }
+
+    /// Returns the numeric instrument ID.
+    ///
+    /// Returns 0 for standalone books created outside the hierarchy.
+    /// Hierarchy-created books get unique IDs from the
+    /// [`InstrumentRegistry`](super::instrument_registry::InstrumentRegistry).
+    #[must_use]
+    #[inline]
+    pub const fn instrument_id(&self) -> u32 {
+        self.instrument_id
     }
 
     /// Returns the current lifecycle status of this instrument.
@@ -1065,5 +1160,45 @@ mod tests {
         let cancelled = book.cancel_order(oid).unwrap();
         assert!(cancelled);
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn test_default_instrument_id_is_zero() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_id() {
+        let book = OptionOrderBook::new_with_id("BTC-20240329-50000-C", OptionStyle::Call, 42);
+        assert_eq!(book.instrument_id(), 42);
+        assert_eq!(book.symbol(), "BTC-20240329-50000-C");
+    }
+
+    #[test]
+    fn test_new_with_validation_has_zero_id() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_id_and_validation() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_id_and_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            99,
+            &config,
+        );
+        assert_eq!(book.instrument_id(), 99);
+        // Verify validation is applied
+        let vc = book.validation_config();
+        assert!(vc.is_some());
+        assert_eq!(vc.unwrap().tick_size(), Some(10));
     }
 }

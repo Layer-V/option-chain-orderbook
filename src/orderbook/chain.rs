@@ -4,6 +4,7 @@
 //! for managing all strikes within a single expiration.
 
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
+use super::instrument_registry::InstrumentRegistry;
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
@@ -34,6 +35,10 @@ pub struct OptionChainOrderBook {
     strikes: Arc<StrikeOrderBookManager>,
     /// Unique identifier for this option chain order book.
     id: OrderId,
+    /// Instrument registry propagated to strike managers.
+    /// Stored to keep the `Arc` reference alive for the hierarchy.
+    #[allow(dead_code)]
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl OptionChainOrderBook {
@@ -52,6 +57,38 @@ impl OptionChainOrderBook {
             underlying,
             expiration,
             id: OrderId::new(),
+            registry: None,
+        }
+    }
+
+    /// Creates a new option chain order book with an instrument registry.
+    ///
+    /// The registry is propagated to the internal [`StrikeOrderBookManager`]
+    /// so that newly created strikes get unique instrument IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            strikes: Arc::new(StrikeOrderBookManager::new_with_registry(
+                &underlying,
+                expiration,
+                Arc::clone(&registry),
+            )),
+            underlying,
+            expiration,
+            id: OrderId::new(),
+            registry: Some(registry),
         }
     }
 
@@ -204,6 +241,8 @@ pub struct OptionChainOrderBookManager {
     validation_config: SharedValidationConfig,
     /// Contract specs propagated to newly created chains.
     contract_specs: SharedContractSpecs,
+    /// Instrument registry propagated to newly created chains.
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl OptionChainOrderBookManager {
@@ -219,6 +258,31 @@ impl OptionChainOrderBookManager {
             underlying: underlying.into(),
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
+            registry: None,
+        }
+    }
+
+    /// Creates a new option chain manager with an instrument registry.
+    ///
+    /// The registry is propagated to newly created chains and their
+    /// strike managers.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        Self {
+            chains: SkipMap::new(),
+            underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
         }
     }
 
@@ -276,7 +340,15 @@ impl OptionChainOrderBookManager {
         if let Some(entry) = self.chains.get(&expiration) {
             return Arc::clone(entry.value());
         }
-        let chain = Arc::new(OptionChainOrderBook::new(&self.underlying, expiration));
+        let chain = if let Some(ref reg) = self.registry {
+            Arc::new(OptionChainOrderBook::new_with_registry(
+                &self.underlying,
+                expiration,
+                Arc::clone(reg),
+            ))
+        } else {
+            Arc::new(OptionChainOrderBook::new(&self.underlying, expiration))
+        };
         if let Some(ref config) = self.validation_config.get() {
             chain.set_validation(config.clone());
         }
