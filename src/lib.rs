@@ -20,8 +20,8 @@
 //! - **Real-Time Order Book per Option**: Individual order books for each option
 //!   contract with full depth, powered by OrderBook-rs.
 //!
-//! - **Thread-Safe Concurrent Access**: Uses `DashMap` for concurrent access
-//!   to order books across multiple threads.
+//! - **Thread-Safe Concurrent Access**: Uses `SkipMap` for lock-free concurrent
+//!   access to order books across multiple threads.
 //!
 //! - **OptionStratLib Integration**: Use Greeks calculation, `ExpirationDate`,
 //!   `OptionStyle`, and pricing models directly from OptionStratLib.
@@ -198,14 +198,14 @@
 //! - **Order Operations**: O(log N) for add/cancel operations
 //! - **Best Quote Lookup**: O(1) with caching
 //! - **Thread Safety**: Lock-free operations for concurrent access
-//! - **Hierarchy Traversal**: O(1) access via `DashMap`
+//! - **Hierarchy Traversal**: O(log N) access via `SkipMap`
 //!
 //! ## Dependencies
 //!
-//! - **orderbook-rs** (0.4): Lock-free order book engine
-//! - **optionstratlib** (0.13): Options pricing, Greeks, and strategy analysis
-//! - **dashmap** (6.1): Concurrent hash map for thread-safe access
-//! - **rust_decimal** (1.39): Precise decimal arithmetic
+//! - **orderbook-rs** (0.6): Lock-free order book engine
+//! - **optionstratlib** (0.15): Options pricing, Greeks, and strategy analysis
+//! - **crossbeam-skiplist** (0.1): Lock-free concurrent skip list
+//! - **rust_decimal** (1.40): Precise decimal arithmetic
 //! - **thiserror** (2.0): Error handling
 //! - **serde** (1.0): Serialization support
 

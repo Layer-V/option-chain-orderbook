@@ -132,6 +132,15 @@ pub enum Error {
         message: String,
     },
 
+    /// Error when an order is rejected because the instrument is not active.
+    #[error("instrument not active: {symbol} is {status}")]
+    InstrumentNotActive {
+        /// The instrument symbol.
+        symbol: String,
+        /// The current status of the instrument.
+        status: String,
+    },
+
     /// Error when serialization/deserialization fails.
     #[error("serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
@@ -146,6 +155,10 @@ pub enum Error {
     /// Error from optionstratlib decimal operations.
     #[error("optionstratlib decimal error: {0}")]
     OptionStratLibDecimal(#[from] optionstratlib::error::decimal::DecimalError),
+
+    /// Error from expiration date operations.
+    #[error("expiration date error: {0}")]
+    ExpirationDateError(#[from] optionstratlib::model::ExpirationDateError),
 }
 
 impl Error {
@@ -282,6 +295,15 @@ impl Error {
         }
     }
 
+    /// Creates a new instrument not active error.
+    #[must_use]
+    pub fn instrument_not_active(symbol: impl Into<String>, status: impl Into<String>) -> Self {
+        Self::InstrumentNotActive {
+            symbol: symbol.into(),
+            status: status.into(),
+        }
+    }
+
     /// Creates a new decimal error.
     #[must_use]
     pub fn decimal(message: impl Into<String>) -> Self {
@@ -415,5 +437,14 @@ mod tests {
         let err = Error::expiration_not_found("2024-03-29");
         let msg = err.to_string();
         assert!(msg.contains("2024-03-29"));
+    }
+
+    #[test]
+    fn test_instrument_not_active_error() {
+        let err = Error::instrument_not_active("BTC-20240329-50000-C", "Halted");
+        let msg = err.to_string();
+        assert!(msg.contains("BTC-20240329-50000-C"));
+        assert!(msg.contains("Halted"));
+        assert!(msg.contains("instrument not active"));
     }
 }

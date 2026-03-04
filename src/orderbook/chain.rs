@@ -3,7 +3,9 @@
 //! This module provides the [`OptionChainOrderBook`] and [`OptionChainOrderBookManager`]
 //! for managing all strikes within a single expiration.
 
+use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
+use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
@@ -60,7 +62,7 @@ impl OptionChainOrderBook {
     }
 
     /// Returns the expiration date.
-    #[must_use]
+    #[must_use = "returns the expiration date without modifying the book"]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
     }
@@ -81,6 +83,35 @@ impl OptionChainOrderBook {
     #[must_use]
     pub fn strikes_arc(&self) -> Arc<StrikeOrderBookManager> {
         Arc::clone(&self.strikes)
+    }
+
+    /// Sets the contract specifications for this chain.
+    ///
+    /// Also propagates the specs to the strike manager for newly created strikes.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.strikes.set_specs(specs);
+    }
+
+    /// Returns the current contract specifications, if any.
+    ///
+    /// Delegates to the strike manager to maintain a single source of truth.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.strikes.specs()
+    }
+
+    /// Sets the validation config for all future strikes created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_validation`].
+    /// Existing strikes are not affected.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.strikes.set_validation(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.strikes.validation_config()
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -169,6 +200,10 @@ pub struct OptionChainOrderBookManager {
     chains: SkipMap<ExpirationDate, Arc<OptionChainOrderBook>>,
     /// The underlying asset symbol.
     underlying: String,
+    /// Validation config applied to newly created chains.
+    validation_config: SharedValidationConfig,
+    /// Contract specs propagated to newly created chains.
+    contract_specs: SharedContractSpecs,
 }
 
 impl OptionChainOrderBookManager {
@@ -182,7 +217,37 @@ impl OptionChainOrderBookManager {
         Self {
             chains: SkipMap::new(),
             underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
         }
+    }
+
+    /// Sets the contract specs for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.contract_specs.set(specs);
+    }
+
+    /// Returns the current contract specs, if any.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.contract_specs.get()
+    }
+
+    /// Sets the validation config for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have this config applied.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.validation_config.set(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.validation_config.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -204,11 +269,20 @@ impl OptionChainOrderBookManager {
     }
 
     /// Gets or creates an option chain for the given expiration.
+    ///
+    /// If a validation config has been set via [`set_validation`](Self::set_validation),
+    /// newly created chains will have that config propagated to their strike manager.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<OptionChainOrderBook> {
         if let Some(entry) = self.chains.get(&expiration) {
             return Arc::clone(entry.value());
         }
         let chain = Arc::new(OptionChainOrderBook::new(&self.underlying, expiration));
+        if let Some(ref config) = self.validation_config.get() {
+            chain.set_validation(config.clone());
+        }
+        if let Some(ref specs) = self.contract_specs.get() {
+            chain.set_specs(specs.clone());
+        }
         self.chains.insert(expiration, Arc::clone(&chain));
         chain
     }
@@ -464,5 +538,88 @@ mod tests {
         drop(chain);
 
         assert_eq!(manager.total_order_count(), 1);
+    }
+
+    #[test]
+    fn test_option_chain_set_validation() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = ValidationConfig::new().with_tick_size(100);
+        chain.set_validation(config.clone());
+
+        assert_eq!(chain.validation_config(), Some(config));
+
+        // New strike inherits validation
+        let strike = chain.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_option_chain_no_validation_by_default() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        assert!(chain.validation_config().is_none());
+    }
+
+    #[test]
+    fn test_option_chain_manager_set_validation_propagates() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        let config = ValidationConfig::new().with_tick_size(100);
+        manager.set_validation(config);
+
+        // New chain should inherit validation
+        let chain = manager.get_or_create(test_expiration());
+        let strike = chain.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_option_chain_manager_existing_chain_unaffected() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        // Create chain before setting validation
+        let chain_before = manager.get_or_create(ExpirationDate::Days(pos_or_panic!(30.0)));
+
+        // Set validation after
+        manager.set_validation(ValidationConfig::new().with_tick_size(100));
+
+        // Existing chain's new strikes are NOT affected
+        let strike = chain_before.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_ok()
+        );
+
+        // New chain IS affected
+        let chain_after = manager.get_or_create(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let strike2 = chain_after.get_or_create_strike(50000);
+        assert!(
+            strike2
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
     }
 }

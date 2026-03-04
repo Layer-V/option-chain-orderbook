@@ -4,7 +4,9 @@
 //! for managing all expirations for a single underlying asset.
 
 use super::chain::OptionChainOrderBook;
+use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::strike::StrikeOrderBook;
+use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
@@ -60,7 +62,7 @@ impl ExpirationOrderBook {
     }
 
     /// Returns the expiration date.
-    #[must_use]
+    #[must_use = "returns the expiration date without modifying the book"]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
     }
@@ -81,6 +83,28 @@ impl ExpirationOrderBook {
     #[must_use]
     pub fn chain_arc(&self) -> Arc<OptionChainOrderBook> {
         Arc::clone(&self.chain)
+    }
+
+    /// Returns the contract specifications, if any.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::specs`].
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.chain.specs()
+    }
+
+    /// Sets the validation config for all future strikes created within this expiration.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::set_validation`].
+    /// Existing strikes are not affected.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.chain.set_validation(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.chain.validation_config()
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -139,6 +163,10 @@ pub struct ExpirationOrderBookManager {
     expirations: SkipMap<ExpirationDate, Arc<ExpirationOrderBook>>,
     /// The underlying asset symbol.
     underlying: String,
+    /// Validation config applied to newly created expiration books.
+    validation_config: SharedValidationConfig,
+    /// Contract specs propagated to newly created expiration books.
+    contract_specs: SharedContractSpecs,
 }
 
 impl ExpirationOrderBookManager {
@@ -152,7 +180,37 @@ impl ExpirationOrderBookManager {
         Self {
             expirations: SkipMap::new(),
             underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
         }
+    }
+
+    /// Sets the contract specs for all future expirations created by this manager.
+    ///
+    /// Existing expiration books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have these specs propagated.
+    pub fn set_specs(&self, specs: ContractSpecs) {
+        self.contract_specs.set(specs);
+    }
+
+    /// Returns the current contract specs, if any.
+    #[must_use]
+    pub fn specs(&self) -> Option<ContractSpecs> {
+        self.contract_specs.get()
+    }
+
+    /// Sets the validation config for all future expirations created by this manager.
+    ///
+    /// Existing expiration books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have this config applied.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.validation_config.set(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.validation_config.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -174,11 +232,20 @@ impl ExpirationOrderBookManager {
     }
 
     /// Gets or creates an expiration order book.
+    ///
+    /// If a validation config has been set via [`set_validation`](Self::set_validation),
+    /// newly created expiration books will have that config propagated to their chain.
     pub fn get_or_create(&self, expiration: ExpirationDate) -> Arc<ExpirationOrderBook> {
         if let Some(entry) = self.expirations.get(&expiration) {
             return Arc::clone(entry.value());
         }
         let book = Arc::new(ExpirationOrderBook::new(&self.underlying, expiration));
+        if let Some(ref config) = self.validation_config.get() {
+            book.set_validation(config.clone());
+        }
+        if let Some(ref specs) = self.contract_specs.get() {
+            book.chain().set_specs(specs.clone());
+        }
         self.expirations.insert(expiration, Arc::clone(&book));
         book
     }
@@ -459,5 +526,78 @@ mod tests {
 
         let display = format!("{}", stats);
         assert!(display.contains("BTC"));
+    }
+
+    #[test]
+    fn test_expiration_set_validation() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let config = ValidationConfig::new().with_tick_size(100);
+        book.set_validation(config.clone());
+
+        assert_eq!(book.validation_config(), Some(config));
+
+        let strike = book.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_expiration_manager_set_validation_propagates() {
+        let manager = ExpirationOrderBookManager::new("BTC");
+        let config = ValidationConfig::new().with_tick_size(100);
+        manager.set_validation(config);
+
+        let exp = manager.get_or_create(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_expiration_manager_existing_book_unaffected() {
+        let manager = ExpirationOrderBookManager::new("BTC");
+
+        let exp_before = manager.get_or_create(ExpirationDate::Days(pos_or_panic!(30.0)));
+
+        manager.set_validation(ValidationConfig::new().with_tick_size(100));
+
+        // Existing expiration is NOT affected
+        let strike = exp_before.get_or_create_strike(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_ok()
+        );
+
+        // New expiration IS affected
+        let exp_after = manager.get_or_create(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let strike2 = exp_after.get_or_create_strike(50000);
+        assert!(
+            strike2
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
     }
 }

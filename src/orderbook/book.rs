@@ -3,13 +3,16 @@
 //! This module provides the [`OptionOrderBook`] structure that wraps the
 //! OrderBook-rs `OrderBook<T>` implementation with option-specific functionality.
 
+use super::instrument_status::InstrumentStatus;
 use super::quote::Quote;
+use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, Side, TimeInForce};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Order book for a single option contract.
 ///
@@ -43,6 +46,8 @@ pub struct OptionOrderBook {
     option_style: OptionStyle,
     /// Unique identifier for this order book.
     id: OrderId,
+    /// Lifecycle status of this instrument, stored as atomic u8.
+    status: AtomicU8,
 }
 
 impl OptionOrderBook {
@@ -64,6 +69,75 @@ impl OptionOrderBook {
             last_quote: Arc::new(Quote::empty(0)),
             option_style,
             id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+        }
+    }
+
+    /// Creates a new option order book with pre-trade validation configured.
+    ///
+    /// Validation rules are applied to the underlying `OrderBook` before it is
+    /// wrapped in `Arc`, so they cannot be changed after construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol (e.g., "BTC-20240329-50000-C")
+    /// * `option_style` - The option style (Call or Put)
+    /// * `config` - Validation configuration (tick size, lot size, min/max order size)
+    #[must_use]
+    pub fn new_with_validation(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        config: &ValidationConfig,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+        let mut book = DefaultOrderBook::new(&symbol);
+
+        if let Some(tick) = config.tick_size() {
+            book.set_tick_size(tick);
+        }
+        if let Some(lot) = config.lot_size() {
+            book.set_lot_size(lot);
+        }
+        if let Some(min) = config.min_order_size() {
+            book.set_min_order_size(min);
+        }
+        if let Some(max) = config.max_order_size() {
+            book.set_max_order_size(max);
+        }
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+        }
+    }
+
+    /// Returns the current validation configuration read back from the underlying book,
+    /// or `None` if no validation rules are configured.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        let mut config = ValidationConfig::new();
+        if let Some(tick) = self.book.tick_size() {
+            config = config.with_tick_size(tick);
+        }
+        if let Some(lot) = self.book.lot_size() {
+            config = config.with_lot_size(lot);
+        }
+        if let Some(min) = self.book.min_order_size() {
+            config = config.with_min_order_size(min);
+        }
+        if let Some(max) = self.book.max_order_size() {
+            config = config.with_max_order_size(max);
+        }
+        if config.is_empty() {
+            None
+        } else {
+            Some(config)
         }
     }
 
@@ -110,6 +184,70 @@ impl OptionOrderBook {
         Arc::clone(&self.book)
     }
 
+    /// Returns the current lifecycle status of this instrument.
+    #[must_use]
+    #[inline]
+    pub fn status(&self) -> InstrumentStatus {
+        let raw = self.status.load(Ordering::Acquire);
+        // SAFETY: we only ever store valid InstrumentStatus u8 values.
+        // Fail closed: corrupted values reject orders instead of accepting them.
+        InstrumentStatus::from_u8(raw).unwrap_or(InstrumentStatus::Halted)
+    }
+
+    /// Sets the lifecycle status of this instrument.
+    ///
+    /// # Arguments
+    ///
+    /// * `status` - The new status to set
+    #[inline]
+    pub fn set_status(&self, status: InstrumentStatus) {
+        self.status.store(status as u8, Ordering::Release);
+    }
+
+    /// Halts the instrument, preventing new orders from being accepted.
+    ///
+    /// Existing resting orders are not cancelled. Use [`expire`](Self::expire)
+    /// to both halt and cancel all orders.
+    #[inline]
+    pub fn halt(&self) {
+        self.set_status(InstrumentStatus::Halted);
+    }
+
+    /// Resumes the instrument, allowing new orders to be accepted.
+    #[inline]
+    pub fn resume(&self) {
+        self.set_status(InstrumentStatus::Active);
+    }
+
+    /// Expires the instrument, cancelling all resting orders.
+    ///
+    /// Sets status to [`Expired`](InstrumentStatus::Expired), collects all
+    /// resting order IDs, and clears the book.
+    ///
+    /// # Returns
+    ///
+    /// A vector of order IDs that were cancelled.
+    pub fn expire(&self) -> Vec<OrderId> {
+        self.set_status(InstrumentStatus::Expired);
+        let orders = self.book.get_all_orders();
+        let ids: Vec<OrderId> = orders.iter().map(|o| o.id()).collect();
+        self.clear();
+        ids
+    }
+
+    /// Checks that the instrument is accepting orders, returning an error if not.
+    fn check_active(&self) -> Result<()> {
+        let current = self.status();
+        if current.is_accepting_orders() {
+            Ok(())
+        } else {
+            Err(crate::Error::instrument_not_active(
+                &self.symbol,
+                current.to_string(),
+            ))
+        }
+    }
+
     /// Adds a limit order to the book.
     ///
     /// # Arguments
@@ -118,6 +256,11 @@ impl OptionOrderBook {
     /// * `side` - Buy or Sell side
     /// * `price` - Limit price in smallest units (u128)
     /// * `quantity` - Order quantity in smallest units (u64)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    /// [`Active`](InstrumentStatus::Active).
     pub fn add_limit_order(
         &self,
         order_id: OrderId,
@@ -125,6 +268,7 @@ impl OptionOrderBook {
         price: u128,
         quantity: u64,
     ) -> Result<()> {
+        self.check_active()?;
         self.book
             .add_limit_order(order_id, price, quantity, side, TimeInForce::Gtc, None)
             .map_err(|e| crate::Error::orderbook(e.to_string()))?;
@@ -140,6 +284,11 @@ impl OptionOrderBook {
     /// * `price` - Limit price in smallest units (u128)
     /// * `quantity` - Order quantity in smallest units (u64)
     /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    /// [`Active`](InstrumentStatus::Active).
     pub fn add_limit_order_with_tif(
         &self,
         order_id: OrderId,
@@ -148,6 +297,7 @@ impl OptionOrderBook {
         quantity: u64,
         tif: TimeInForce,
     ) -> Result<()> {
+        self.check_active()?;
         self.book
             .add_limit_order(order_id, price, quantity, side, tif, None)
             .map_err(|e| crate::Error::orderbook(e.to_string()))?;
@@ -614,5 +764,306 @@ mod tests {
         let impact = book.market_impact(5, Side::Buy);
         // avg_price is f64, just verify it's a valid number
         assert!(impact.avg_price >= 0.0 || impact.avg_price < 0.0);
+    }
+
+    #[test]
+    fn test_new_with_validation_tick_size() {
+        let config = ValidationConfig::new().with_tick_size(100);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid price (multiple of 100)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+
+        // Invalid price (not a multiple of 100)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_new_with_validation_lot_size() {
+        let config = ValidationConfig::new().with_lot_size(10);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid quantity (multiple of 10)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 20)
+                .is_ok()
+        );
+
+        // Invalid quantity (not a multiple of 10)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 15)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_new_with_validation_min_max_order_size() {
+        let config = ValidationConfig::new()
+            .with_min_order_size(5)
+            .with_max_order_size(100);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid quantity (within range)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+                .is_ok()
+        );
+
+        // Too small
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 2)
+                .is_err()
+        );
+
+        // Too large
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 200)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validation_config_readback() {
+        let config = ValidationConfig::new()
+            .with_tick_size(100)
+            .with_lot_size(10)
+            .with_min_order_size(1)
+            .with_max_order_size(1000);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        let readback = book.validation_config();
+        assert_eq!(readback, Some(config));
+    }
+
+    #[test]
+    fn test_no_validation_by_default() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.validation_config().is_none());
+
+        // Any price/quantity should work
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+                .is_ok()
+        );
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_new_with_empty_validation() {
+        let config = ValidationConfig::new();
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Empty config = no validation = anything goes
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+                .is_ok()
+        );
+    }
+
+    // ── Instrument status tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_default_status_is_active() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.status(), InstrumentStatus::Active);
+    }
+
+    #[test]
+    fn test_default_status_is_active_with_validation() {
+        let config = ValidationConfig::new().with_tick_size(100);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+        assert_eq!(book.status(), InstrumentStatus::Active);
+    }
+
+    #[test]
+    fn test_set_status_and_get() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        for &status in &[
+            InstrumentStatus::Pending,
+            InstrumentStatus::Active,
+            InstrumentStatus::Halted,
+            InstrumentStatus::Settling,
+            InstrumentStatus::Expired,
+        ] {
+            book.set_status(status);
+            assert_eq!(book.status(), status);
+        }
+    }
+
+    #[test]
+    fn test_halt_sets_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.status(), InstrumentStatus::Active);
+
+        book.halt();
+        assert_eq!(book.status(), InstrumentStatus::Halted);
+    }
+
+    #[test]
+    fn test_resume_sets_active() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+        assert_eq!(book.status(), InstrumentStatus::Halted);
+
+        book.resume();
+        assert_eq!(book.status(), InstrumentStatus::Active);
+    }
+
+    #[test]
+    fn test_expire_sets_expired_and_clears() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        let id1 = OrderId::new();
+        let id2 = OrderId::new();
+        book.add_limit_order(id1, Side::Buy, 100, 10).unwrap();
+        book.add_limit_order(id2, Side::Sell, 105, 5).unwrap();
+        assert_eq!(book.order_count(), 2);
+
+        let cancelled = book.expire();
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+        assert!(book.is_empty());
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancelled.contains(&id1));
+        assert!(cancelled.contains(&id2));
+    }
+
+    #[test]
+    fn test_expire_on_empty_book() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let cancelled = book.expire();
+        assert_eq!(book.status(), InstrumentStatus::Expired);
+        assert!(cancelled.is_empty());
+    }
+
+    #[test]
+    fn test_order_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+
+        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("instrument not active"));
+        assert!(err.to_string().contains("Halted"));
+    }
+
+    #[test]
+    fn test_order_rejected_when_pending() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Pending);
+
+        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Pending"));
+    }
+
+    #[test]
+    fn test_order_rejected_when_settling() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Settling);
+
+        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Settling"));
+    }
+
+    #[test]
+    fn test_order_rejected_when_expired() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.set_status(InstrumentStatus::Expired);
+
+        let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Expired"));
+    }
+
+    #[test]
+    fn test_order_rejected_with_tif_when_not_active() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+
+        let result =
+            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Halted"));
+    }
+
+    #[test]
+    fn test_orders_accepted_after_resume() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.halt();
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .is_err()
+        );
+
+        book.resume();
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_halt_preserves_existing_orders() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        book.halt();
+        // Existing orders remain
+        assert_eq!(book.order_count(), 1);
+        assert_eq!(book.best_bid(), Some(100));
+    }
+
+    #[test]
+    fn test_cancel_works_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        let oid = OrderId::new();
+        book.add_limit_order(oid, Side::Buy, 100, 10).unwrap();
+        book.halt();
+
+        // Cancellation should still work on halted instruments
+        let cancelled = book.cancel_order(oid).unwrap();
+        assert!(cancelled);
+        assert!(book.is_empty());
     }
 }
