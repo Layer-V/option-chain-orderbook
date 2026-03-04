@@ -5,12 +5,13 @@
 
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::instrument_registry::InstrumentRegistry;
+use super::stp::SharedSTPMode;
 use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::OrderId;
+use orderbook_rs::{OrderId, STPMode};
 use std::sync::Arc;
 
 /// Option chain order book for a single expiration.
@@ -151,6 +152,20 @@ impl OptionChainOrderBook {
         self.strikes.validation_config()
     }
 
+    /// Sets the STP mode for all future option books created within this chain.
+    ///
+    /// Delegates to the underlying [`StrikeOrderBookManager::set_stp_mode`].
+    /// Existing books are not affected.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.strikes.set_stp_mode(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.strikes.stp_mode()
+    }
+
     /// Gets or creates a strike order book, returning an Arc reference.
     pub fn get_or_create_strike(&self, strike: u64) -> Arc<StrikeOrderBook> {
         self.strikes.get_or_create(strike)
@@ -243,6 +258,8 @@ pub struct OptionChainOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry propagated to newly created chains.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// STP mode propagated to newly created chains.
+    stp_mode: SharedSTPMode,
 }
 
 impl OptionChainOrderBookManager {
@@ -259,6 +276,7 @@ impl OptionChainOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -283,6 +301,7 @@ impl OptionChainOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -312,6 +331,20 @@ impl OptionChainOrderBookManager {
     #[must_use]
     pub fn validation_config(&self) -> Option<ValidationConfig> {
         self.validation_config.get()
+    }
+
+    /// Sets the STP mode for all future chains created by this manager.
+    ///
+    /// Existing chains are not affected. Only newly created chains
+    /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -354,6 +387,10 @@ impl OptionChainOrderBookManager {
         }
         if let Some(ref specs) = self.contract_specs.get() {
             chain.set_specs(specs.clone());
+        }
+        let stp = self.stp_mode.get();
+        if stp != STPMode::None {
+            chain.set_stp_mode(stp);
         }
         self.chains.insert(expiration, Arc::clone(&chain));
         chain

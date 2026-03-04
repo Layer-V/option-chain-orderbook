@@ -8,7 +8,8 @@ use super::quote::Quote;
 use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
-use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, Side, TimeInForce};
+use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, STPMode, Side, TimeInForce};
+use pricelevel::Hash32;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -129,19 +130,7 @@ impl OptionOrderBook {
         let symbol = symbol.into();
         let symbol_hash = Self::hash_symbol(&symbol);
         let mut book = DefaultOrderBook::new(&symbol);
-
-        if let Some(tick) = config.tick_size() {
-            book.set_tick_size(tick);
-        }
-        if let Some(lot) = config.lot_size() {
-            book.set_lot_size(lot);
-        }
-        if let Some(min) = config.min_order_size() {
-            book.set_min_order_size(min);
-        }
-        if let Some(max) = config.max_order_size() {
-            book.set_max_order_size(max);
-        }
+        Self::apply_validation(&mut book, config);
 
         Self {
             symbol,
@@ -179,7 +168,148 @@ impl OptionOrderBook {
         let symbol = symbol.into();
         let symbol_hash = Self::hash_symbol(&symbol);
         let mut book = DefaultOrderBook::new(&symbol);
+        Self::apply_validation(&mut book, config);
 
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(instrument_id),
+        }
+    }
+
+    /// Creates a new option order book with STP mode configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `stp_mode` - Self-trade prevention mode
+    #[must_use]
+    pub(crate) fn new_with_stp(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        stp_mode: STPMode,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+
+        Self {
+            symbol: symbol.clone(),
+            symbol_hash,
+            book: Arc::new(DefaultOrderBook::with_stp_mode(&symbol, stp_mode)),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(0),
+        }
+    }
+
+    /// Creates a new option order book with instrument ID and STP mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `instrument_id` - The unique numeric instrument ID
+    /// * `stp_mode` - Self-trade prevention mode
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_id_and_stp(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        instrument_id: u32,
+        stp_mode: STPMode,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+
+        Self {
+            symbol: symbol.clone(),
+            symbol_hash,
+            book: Arc::new(DefaultOrderBook::with_stp_mode(&symbol, stp_mode)),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(instrument_id),
+        }
+    }
+
+    /// Creates a new option order book with validation and STP mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `config` - Validation configuration
+    /// * `stp_mode` - Self-trade prevention mode
+    #[must_use]
+    pub(crate) fn new_with_validation_and_stp(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        config: &ValidationConfig,
+        stp_mode: STPMode,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+        let mut book = DefaultOrderBook::with_stp_mode(&symbol, stp_mode);
+        Self::apply_validation(&mut book, config);
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(0),
+        }
+    }
+
+    /// Creates a new option order book with instrument ID, validation, and STP mode.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol
+    /// * `option_style` - The option style (Call or Put)
+    /// * `instrument_id` - The unique numeric instrument ID
+    /// * `config` - Validation configuration
+    /// * `stp_mode` - Self-trade prevention mode
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_id_validation_and_stp(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        instrument_id: u32,
+        config: &ValidationConfig,
+        stp_mode: STPMode,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+        let mut book = DefaultOrderBook::with_stp_mode(&symbol, stp_mode);
+        Self::apply_validation(&mut book, config);
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+            status: AtomicU8::new(InstrumentStatus::Active as u8),
+            instrument_id: AtomicU32::new(instrument_id),
+        }
+    }
+
+    /// Applies validation config to a mutable order book before wrapping in `Arc`.
+    fn apply_validation(book: &mut DefaultOrderBook, config: &ValidationConfig) {
         if let Some(tick) = config.tick_size() {
             book.set_tick_size(tick);
         }
@@ -191,17 +321,6 @@ impl OptionOrderBook {
         }
         if let Some(max) = config.max_order_size() {
             book.set_max_order_size(max);
-        }
-
-        Self {
-            symbol,
-            symbol_hash,
-            book: Arc::new(book),
-            last_quote: Arc::new(Quote::empty(0)),
-            option_style,
-            id: OrderId::new(),
-            status: AtomicU8::new(InstrumentStatus::Active as u8),
-            instrument_id: AtomicU32::new(instrument_id),
         }
     }
 
@@ -290,6 +409,15 @@ impl OptionOrderBook {
     #[inline]
     pub(crate) fn set_instrument_id(&self, id: u32) {
         self.instrument_id.store(id, Ordering::Relaxed);
+    }
+
+    /// Returns the configured self-trade prevention mode.
+    ///
+    /// [`STPMode::None`] means STP is disabled (default).
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.book.stp_mode()
     }
 
     /// Returns the current lifecycle status of this instrument.
@@ -408,6 +536,82 @@ impl OptionOrderBook {
         self.check_active()?;
         self.book
             .add_limit_order(order_id, price, quantity, side, tif, None)
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Adds a limit order with user identity for self-trade prevention.
+    ///
+    /// When STP is enabled on this book, the `user_id` is used to detect
+    /// self-trades. Use [`Hash32::zero()`] to bypass STP checks.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `quantity` - Order quantity in smallest units (u64)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order
+    ///   (e.g., `MissingUserId` when STP is enabled and `user_id` is zero).
+    pub fn add_limit_order_with_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.check_active()?;
+        self.book
+            .add_limit_order_with_user(
+                order_id,
+                price,
+                quantity,
+                side,
+                TimeInForce::Gtc,
+                user_id,
+                None,
+            )
+            .map_err(|e| crate::Error::orderbook(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Adds a limit order with time-in-force and user identity for STP.
+    ///
+    /// Combines time-in-force specification with self-trade prevention.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - Unique identifier for the order
+    /// * `side` - Buy or Sell side
+    /// * `price` - Limit price in smallest units (u128)
+    /// * `quantity` - Order quantity in smallest units (u64)
+    /// * `tif` - Time-in-force (GTC, IOC, FOK, etc.)
+    /// * `user_id` - Owner identity for STP checks
+    ///
+    /// # Errors
+    ///
+    /// - [`InstrumentNotActive`](crate::Error::InstrumentNotActive) if the instrument is not
+    ///   [`Active`](InstrumentStatus::Active).
+    /// - [`OrderBookError`](crate::Error::OrderBookError) if the upstream book rejects the order.
+    pub fn add_limit_order_with_tif_and_user(
+        &self,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+        tif: TimeInForce,
+        user_id: Hash32,
+    ) -> Result<()> {
+        self.check_active()?;
+        self.book
+            .add_limit_order_with_user(order_id, price, quantity, side, tif, user_id, None)
             .map_err(|e| crate::Error::orderbook(e.to_string()))?;
         Ok(())
     }
@@ -1213,5 +1417,186 @@ mod tests {
         let vc = book.validation_config();
         assert!(vc.is_some());
         assert_eq!(vc.unwrap().tick_size(), Some(10));
+    }
+
+    #[test]
+    fn test_stp_mode_default_is_none() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.stp_mode(), STPMode::None);
+    }
+
+    #[test]
+    fn test_new_with_stp_cancel_taker() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+        assert_eq!(book.instrument_id(), 0);
+    }
+
+    #[test]
+    fn test_new_with_id_and_stp() {
+        let book = OptionOrderBook::new_with_id_and_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            42,
+            STPMode::CancelMaker,
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelMaker);
+        assert_eq!(book.instrument_id(), 42);
+    }
+
+    #[test]
+    fn test_new_with_validation_and_stp() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_validation_and_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+            STPMode::CancelBoth,
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelBoth);
+        assert_eq!(
+            book.validation_config().map(|c| c.tick_size()),
+            Some(Some(10))
+        );
+    }
+
+    #[test]
+    fn test_new_with_id_validation_and_stp() {
+        let config = super::super::validation::ValidationConfig::new().with_tick_size(10);
+        let book = OptionOrderBook::new_with_id_validation_and_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            7,
+            &config,
+            STPMode::CancelTaker,
+        );
+        assert_eq!(book.stp_mode(), STPMode::CancelTaker);
+        assert_eq!(book.instrument_id(), 7);
+        assert_eq!(
+            book.validation_config().map(|c| c.tick_size()),
+            Some(Some(10))
+        );
+    }
+
+    #[test]
+    fn test_add_limit_order_with_user() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user = Hash32::from([1u8; 32]);
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_ok());
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_tif_and_user() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user = Hash32::from([2u8; 32]);
+        let result = book.add_limit_order_with_tif_and_user(
+            OrderId::new(),
+            Side::Sell,
+            200,
+            5,
+            TimeInForce::Gtc,
+            user,
+        );
+        assert!(result.is_ok());
+        assert_eq!(book.order_count(), 1);
+    }
+
+    #[test]
+    fn test_stp_cancel_taker_prevents_self_trade() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — STP triggers, returns error
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+        // Maker (sell) should still be there
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_ask().is_some());
+    }
+
+    #[test]
+    fn test_stp_cancel_maker_removes_resting_order() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelMaker,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — maker cancelled, taker rests
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user)
+            .unwrap();
+        // Taker (buy) should now be resting, maker (sell) was cancelled
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_bid().is_some());
+    }
+
+    #[test]
+    fn test_stp_cancel_both_removes_all() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelBoth,
+        );
+        let user = Hash32::from([1u8; 32]);
+
+        // Place a resting sell order
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+            .unwrap();
+        assert_eq!(book.order_count(), 1);
+
+        // Same user places a crossing buy — STP triggers, returns error
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stp_different_users_trade_normally() {
+        let book = OptionOrderBook::new_with_stp(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            STPMode::CancelTaker,
+        );
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        // User A sells
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user_a)
+            .unwrap();
+
+        // User B buys — should trade normally
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_b)
+            .unwrap();
+        // Both matched and removed
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_add_limit_order_with_user_rejected_when_halted() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.halt();
+        let user = Hash32::from([1u8; 32]);
+        let result = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user);
+        assert!(result.is_err());
     }
 }

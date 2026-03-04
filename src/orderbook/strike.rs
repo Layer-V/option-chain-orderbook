@@ -7,13 +7,14 @@ use super::book::OptionOrderBook;
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
+use super::stp::SharedSTPMode;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::OrderId;
+use orderbook_rs::{OrderId, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single strike price containing both call and put.
@@ -174,6 +175,16 @@ impl StrikeOrderBook {
         self.id
     }
 
+    /// Returns the STP mode configured on the call book.
+    ///
+    /// Both call and put books share the same STP mode when created
+    /// through the hierarchy, so reading from the call book is sufficient.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.call.stp_mode()
+    }
+
     /// Returns a reference to the call order book.
     #[must_use]
     pub fn call(&self) -> &OptionOrderBook {
@@ -292,6 +303,8 @@ pub struct StrikeOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry for allocating IDs to new option books.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// STP mode applied to newly created option books.
+    stp_mode: SharedSTPMode,
 }
 
 impl StrikeOrderBookManager {
@@ -310,6 +323,7 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -336,6 +350,7 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -373,6 +388,20 @@ impl StrikeOrderBookManager {
     #[must_use]
     pub fn validation_config(&self) -> Option<ValidationConfig> {
         self.validation_config.get()
+    }
+
+    /// Sets the STP mode for all future option books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will use this mode.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -434,7 +463,7 @@ impl StrikeOrderBookManager {
     }
 
     /// Internal helper that builds a [`StrikeOrderBook`] with optional
-    /// validation config but **without** allocating instrument IDs.
+    /// validation config and STP mode but **without** allocating instrument IDs.
     ///
     /// IDs are assigned later by [`assign_instrument_ids`](Self::assign_instrument_ids)
     /// only after confirming the book won the insertion race.
@@ -445,23 +474,56 @@ impl StrikeOrderBookManager {
         let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
 
         let validation = self.validation_config.get();
+        let stp = self.stp_mode.get();
+        let has_stp = stp != STPMode::None;
 
-        let (call, put) = if let Some(config) = &validation {
-            let call = Arc::new(OptionOrderBook::new_with_validation(
-                &call_symbol,
-                OptionStyle::Call,
-                config,
-            ));
-            let put = Arc::new(OptionOrderBook::new_with_validation(
-                &put_symbol,
-                OptionStyle::Put,
-                config,
-            ));
-            (call, put)
-        } else {
-            let call = Arc::new(OptionOrderBook::new(&call_symbol, OptionStyle::Call));
-            let put = Arc::new(OptionOrderBook::new(&put_symbol, OptionStyle::Put));
-            (call, put)
+        let (call, put) = match (&validation, has_stp) {
+            (Some(config), true) => {
+                let call = Arc::new(OptionOrderBook::new_with_validation_and_stp(
+                    &call_symbol,
+                    OptionStyle::Call,
+                    config,
+                    stp,
+                ));
+                let put = Arc::new(OptionOrderBook::new_with_validation_and_stp(
+                    &put_symbol,
+                    OptionStyle::Put,
+                    config,
+                    stp,
+                ));
+                (call, put)
+            }
+            (Some(config), false) => {
+                let call = Arc::new(OptionOrderBook::new_with_validation(
+                    &call_symbol,
+                    OptionStyle::Call,
+                    config,
+                ));
+                let put = Arc::new(OptionOrderBook::new_with_validation(
+                    &put_symbol,
+                    OptionStyle::Put,
+                    config,
+                ));
+                (call, put)
+            }
+            (None, true) => {
+                let call = Arc::new(OptionOrderBook::new_with_stp(
+                    &call_symbol,
+                    OptionStyle::Call,
+                    stp,
+                ));
+                let put = Arc::new(OptionOrderBook::new_with_stp(
+                    &put_symbol,
+                    OptionStyle::Put,
+                    stp,
+                ));
+                (call, put)
+            }
+            (None, false) => {
+                let call = Arc::new(OptionOrderBook::new(&call_symbol, OptionStyle::Call));
+                let put = Arc::new(OptionOrderBook::new(&put_symbol, OptionStyle::Put));
+                (call, put)
+            }
         };
 
         Arc::new(StrikeOrderBook::from_books(
@@ -488,15 +550,36 @@ impl StrikeOrderBookManager {
             book.call().set_instrument_id(call_id);
             book.put().set_instrument_id(put_id);
 
-            reg.register(
+            Self::register_pair(
+                reg,
+                &call_symbol,
+                &put_symbol,
                 call_id,
-                InstrumentInfo::new(&call_symbol, self.expiration, strike, OptionStyle::Call),
-            );
-            reg.register(
                 put_id,
-                InstrumentInfo::new(&put_symbol, self.expiration, strike, OptionStyle::Put),
+                self.expiration,
+                strike,
             );
         }
+    }
+
+    /// Registers a call/put pair in the instrument registry.
+    fn register_pair(
+        reg: &InstrumentRegistry,
+        call_symbol: &str,
+        put_symbol: &str,
+        call_id: u32,
+        put_id: u32,
+        expiration: ExpirationDate,
+        strike: u64,
+    ) {
+        reg.register(
+            call_id,
+            InstrumentInfo::new(call_symbol, expiration, strike, OptionStyle::Call),
+        );
+        reg.register(
+            put_id,
+            InstrumentInfo::new(put_symbol, expiration, strike, OptionStyle::Put),
+        );
     }
 
     /// Gets a strike order book by strike price.

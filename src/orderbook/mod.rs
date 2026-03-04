@@ -54,6 +54,7 @@ mod expiration;
 mod instrument_registry;
 mod instrument_status;
 mod quote;
+mod stp;
 mod strike;
 mod underlying;
 mod validation;
@@ -71,3 +72,7 @@ pub use underlying::{
     GlobalStats, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
 };
 pub use validation::ValidationConfig;
+
+// Re-export upstream types used in the STP API
+pub use orderbook_rs::STPMode;
+pub use pricelevel::Hash32;

@@ -6,12 +6,13 @@
 use super::chain::OptionChainOrderBook;
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::instrument_registry::InstrumentRegistry;
+use super::stp::SharedSTPMode;
 use super::strike::StrikeOrderBook;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::OrderId;
+use orderbook_rs::{OrderId, STPMode};
 use std::sync::Arc;
 
 /// Order book for a single expiration date.
@@ -144,6 +145,20 @@ impl ExpirationOrderBook {
         self.chain.validation_config()
     }
 
+    /// Sets the STP mode for all future option books created within this expiration.
+    ///
+    /// Delegates to the underlying [`OptionChainOrderBook::set_stp_mode`].
+    /// Existing books are not affected.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.chain.set_stp_mode(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.chain.stp_mode()
+    }
+
     /// Gets or creates a strike order book, returning an Arc reference.
     pub fn get_or_create_strike(&self, strike: u64) -> Arc<StrikeOrderBook> {
         self.chain.get_or_create_strike(strike)
@@ -206,6 +221,8 @@ pub struct ExpirationOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry propagated to newly created expiration books.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// STP mode propagated to newly created expiration books.
+    stp_mode: SharedSTPMode,
 }
 
 impl ExpirationOrderBookManager {
@@ -222,6 +239,7 @@ impl ExpirationOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -245,6 +263,7 @@ impl ExpirationOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            stp_mode: SharedSTPMode::new(),
         }
     }
 
@@ -274,6 +293,20 @@ impl ExpirationOrderBookManager {
     #[must_use]
     pub fn validation_config(&self) -> Option<ValidationConfig> {
         self.validation_config.get()
+    }
+
+    /// Sets the STP mode for all future expiration books created by this manager.
+    ///
+    /// Existing books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    pub fn set_stp_mode(&self, mode: STPMode) {
+        self.stp_mode.set(mode);
+    }
+
+    /// Returns the current STP mode.
+    #[must_use]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp_mode.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -316,6 +349,10 @@ impl ExpirationOrderBookManager {
         }
         if let Some(ref specs) = self.contract_specs.get() {
             book.chain().set_specs(specs.clone());
+        }
+        let stp = self.stp_mode.get();
+        if stp != STPMode::None {
+            book.set_stp_mode(stp);
         }
         self.expirations.insert(expiration, Arc::clone(&book));
         book
