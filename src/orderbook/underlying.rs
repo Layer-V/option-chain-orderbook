@@ -5,6 +5,7 @@
 
 use super::contract_specs::ContractSpecs;
 use super::expiration::{ExpirationOrderBook, ExpirationOrderBookManager};
+use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
@@ -29,6 +30,10 @@ pub struct UnderlyingOrderBook {
     underlying: String,
     /// Expiration order book manager.
     expirations: ExpirationOrderBookManager,
+    /// Instrument registry propagated to expiration managers.
+    /// Stored to keep the `Arc` reference alive for the hierarchy.
+    #[allow(dead_code)]
+    registry: Option<Arc<InstrumentRegistry>>,
 }
 
 impl UnderlyingOrderBook {
@@ -44,6 +49,33 @@ impl UnderlyingOrderBook {
         Self {
             expirations: ExpirationOrderBookManager::new(&underlying),
             underlying,
+            registry: None,
+        }
+    }
+
+    /// Creates a new underlying order book with an instrument registry.
+    ///
+    /// The registry is propagated to the internal [`ExpirationOrderBookManager`]
+    /// and all subsequently created expirations, chains, and strikes.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    #[must_use]
+    pub(crate) fn new_with_registry(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            expirations: ExpirationOrderBookManager::new_with_registry(
+                &underlying,
+                Arc::clone(&registry),
+            ),
+            underlying,
+            registry: Some(registry),
         }
     }
 
@@ -189,6 +221,8 @@ impl std::fmt::Display for UnderlyingStats {
 pub struct UnderlyingOrderBookManager {
     /// Underlying order books indexed by symbol.
     underlyings: SkipMap<String, Arc<UnderlyingOrderBook>>,
+    /// Shared instrument registry for allocating unique IDs.
+    registry: Arc<InstrumentRegistry>,
 }
 
 impl Default for UnderlyingOrderBookManager {
@@ -199,10 +233,32 @@ impl Default for UnderlyingOrderBookManager {
 
 impl UnderlyingOrderBookManager {
     /// Creates a new underlying order book manager.
+    ///
+    /// Instrument IDs start from 1. ID 0 is reserved for standalone
+    /// [`OptionOrderBook`](super::book::OptionOrderBook) instances
+    /// created outside the hierarchy.
     #[must_use]
     pub fn new() -> Self {
         Self {
             underlyings: SkipMap::new(),
+            registry: Arc::new(InstrumentRegistry::new()),
+        }
+    }
+
+    /// Creates a new underlying order book manager with a seed for the
+    /// instrument ID allocator.
+    ///
+    /// Use this to resume ID allocation after a hierarchy rebuild,
+    /// ensuring previously assigned IDs are not reused.
+    ///
+    /// # Arguments
+    ///
+    /// * `seed` - The starting instrument ID value
+    #[must_use]
+    pub fn new_with_seed(seed: u32) -> Self {
+        Self {
+            underlyings: SkipMap::new(),
+            registry: Arc::new(InstrumentRegistry::new_with_seed(seed)),
         }
     }
 
@@ -219,12 +275,19 @@ impl UnderlyingOrderBookManager {
     }
 
     /// Gets or creates an underlying order book.
+    ///
+    /// The shared [`InstrumentRegistry`] is automatically propagated
+    /// so that all [`OptionOrderBook`](super::book::OptionOrderBook)
+    /// instances created through the hierarchy receive unique IDs.
     pub fn get_or_create(&self, underlying: impl Into<String>) -> Arc<UnderlyingOrderBook> {
         let underlying = underlying.into();
         if let Some(entry) = self.underlyings.get(&underlying) {
             return Arc::clone(entry.value());
         }
-        let book = Arc::new(UnderlyingOrderBook::new(&underlying));
+        let book = Arc::new(UnderlyingOrderBook::new_with_registry(
+            &underlying,
+            Arc::clone(&self.registry),
+        ));
         self.underlyings.insert(underlying, Arc::clone(&book));
         book
     }
@@ -291,6 +354,40 @@ impl UnderlyingOrderBookManager {
             .iter()
             .map(|e| e.value().total_strike_count())
             .sum()
+    }
+
+    /// Looks up instrument info by numeric instrument ID.
+    ///
+    /// Returns `None` if the ID is not registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The instrument ID to look up
+    #[must_use]
+    pub fn get_by_instrument_id(&self, id: u32) -> Option<InstrumentInfo> {
+        self.registry.get(id)
+    }
+
+    /// Returns the number of registered instruments across all underlyings.
+    #[must_use]
+    pub fn instrument_count(&self) -> usize {
+        self.registry.len()
+    }
+
+    /// Returns the current instrument ID counter value.
+    ///
+    /// This is the next ID that will be allocated. Useful for persisting
+    /// the counter state before shutdown so it can be used as a seed
+    /// for [`new_with_seed`](Self::new_with_seed).
+    #[must_use]
+    pub fn current_instrument_id(&self) -> u32 {
+        self.registry.current_id()
+    }
+
+    /// Returns a reference to the shared instrument registry.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<InstrumentRegistry> {
+        &self.registry
     }
 
     /// Returns statistics about the entire order book system.
@@ -842,5 +939,181 @@ mod tests {
                 .add_limit_order(OrderId::new(), Side::Buy, 150, 7)
                 .is_ok()
         );
+    }
+
+    // --- Instrument ID tests ---
+
+    #[test]
+    fn test_manager_starts_with_id_one() {
+        let manager = UnderlyingOrderBookManager::new();
+        assert_eq!(manager.current_instrument_id(), 1);
+        assert_eq!(manager.instrument_count(), 0);
+    }
+
+    #[test]
+    fn test_manager_new_with_seed() {
+        let manager = UnderlyingOrderBookManager::new_with_seed(100);
+        assert_eq!(manager.current_instrument_id(), 100);
+    }
+
+    #[test]
+    fn test_strike_creation_assigns_instrument_ids() {
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        // Call and put should have unique, non-zero IDs
+        let call_id = strike.call().instrument_id();
+        let put_id = strike.put().instrument_id();
+
+        assert_ne!(call_id, 0);
+        assert_ne!(put_id, 0);
+        assert_ne!(call_id, put_id);
+    }
+
+    #[test]
+    fn test_multiple_strikes_get_distinct_ids() {
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+
+        let s1 = exp.get_or_create_strike(50000);
+        let s2 = exp.get_or_create_strike(55000);
+        let s3 = exp.get_or_create_strike(60000);
+
+        let ids: Vec<u32> = vec![
+            s1.call().instrument_id(),
+            s1.put().instrument_id(),
+            s2.call().instrument_id(),
+            s2.put().instrument_id(),
+            s3.call().instrument_id(),
+            s3.put().instrument_id(),
+        ];
+
+        // All 6 IDs should be unique
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), 6);
+
+        // All non-zero
+        assert!(ids.iter().all(|&id| id != 0));
+
+        // 3 strikes × 2 books = 6 instruments
+        assert_eq!(manager.instrument_count(), 6);
+    }
+
+    #[test]
+    fn test_reverse_lookup_returns_correct_info() {
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+
+        let call_id = strike.call().instrument_id();
+        let put_id = strike.put().instrument_id();
+
+        // Look up call
+        let call_info = manager.get_by_instrument_id(call_id);
+        assert!(call_info.is_some());
+        let call_info = call_info.unwrap();
+        assert!(call_info.symbol().contains("50000"));
+        assert!(call_info.symbol().ends_with("-C"));
+        assert_eq!(call_info.strike(), 50000);
+        assert_eq!(call_info.option_style(), optionstratlib::OptionStyle::Call);
+
+        // Look up put
+        let put_info = manager.get_by_instrument_id(put_id);
+        assert!(put_info.is_some());
+        let put_info = put_info.unwrap();
+        assert!(put_info.symbol().ends_with("-P"));
+        assert_eq!(put_info.strike(), 50000);
+        assert_eq!(put_info.option_style(), optionstratlib::OptionStyle::Put);
+    }
+
+    #[test]
+    fn test_reverse_lookup_missing_returns_none() {
+        let manager = UnderlyingOrderBookManager::new();
+        assert!(manager.get_by_instrument_id(999).is_none());
+    }
+
+    #[test]
+    fn test_ids_across_underlyings_are_unique() {
+        let manager = UnderlyingOrderBookManager::new();
+        let exp = test_expiration();
+
+        let btc = manager.get_or_create("BTC");
+        let btc_exp = btc.get_or_create_expiration(exp);
+        let btc_strike = btc_exp.get_or_create_strike(50000);
+
+        let eth = manager.get_or_create("ETH");
+        let eth_exp = eth.get_or_create_expiration(exp);
+        let eth_strike = eth_exp.get_or_create_strike(3000);
+
+        let btc_call = btc_strike.call().instrument_id();
+        let btc_put = btc_strike.put().instrument_id();
+        let eth_call = eth_strike.call().instrument_id();
+        let eth_put = eth_strike.put().instrument_id();
+
+        let mut ids = vec![btc_call, btc_put, eth_call, eth_put];
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 4);
+    }
+
+    #[test]
+    fn test_seed_survives_rebuild() {
+        // First manager: create some instruments
+        let manager1 = UnderlyingOrderBookManager::new();
+        let btc1 = manager1.get_or_create("BTC");
+        let exp1 = btc1.get_or_create_expiration(test_expiration());
+        exp1.get_or_create_strike(50000);
+        let seed = manager1.current_instrument_id();
+
+        // Second manager: rebuild with seed
+        let manager2 = UnderlyingOrderBookManager::new_with_seed(seed);
+        let btc2 = manager2.get_or_create("BTC");
+        let exp2 = btc2.get_or_create_expiration(test_expiration());
+        let s2 = exp2.get_or_create_strike(55000);
+
+        // New IDs should start from where the first manager left off
+        assert!(s2.call().instrument_id() >= seed);
+        assert!(s2.put().instrument_id() >= seed);
+    }
+
+    #[test]
+    fn test_idempotent_get_or_create_preserves_ids() {
+        let manager = UnderlyingOrderBookManager::new();
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let s1 = exp.get_or_create_strike(50000);
+        let call_id = s1.call().instrument_id();
+        let put_id = s1.put().instrument_id();
+
+        // Second get_or_create returns the same book
+        let s1_again = exp.get_or_create_strike(50000);
+        assert_eq!(s1_again.call().instrument_id(), call_id);
+        assert_eq!(s1_again.put().instrument_id(), put_id);
+
+        // No new instruments registered
+        assert_eq!(manager.instrument_count(), 2);
+    }
+
+    #[test]
+    fn test_registry_accessor() {
+        let manager = UnderlyingOrderBookManager::new();
+        let registry = manager.registry();
+        assert_eq!(registry.current_id(), 1);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn test_standalone_books_have_zero_id() {
+        use crate::orderbook::strike::StrikeOrderBook;
+
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        assert_eq!(strike.call().instrument_id(), 0);
+        assert_eq!(strike.put().instrument_id(), 0);
     }
 }

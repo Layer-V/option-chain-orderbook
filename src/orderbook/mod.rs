@@ -51,6 +51,8 @@ mod book;
 mod chain;
 mod contract_specs;
 mod expiration;
+mod instrument_registry;
+mod instrument_status;
 mod quote;
 mod strike;
 mod underlying;
@@ -61,6 +63,8 @@ pub use book::OptionOrderBook;
 pub use chain::{OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats};
 pub use contract_specs::{ContractSpecs, ContractSpecsBuilder, ExerciseStyle, SettlementType};
 pub use expiration::{ExpirationManagerStats, ExpirationOrderBook, ExpirationOrderBookManager};
+pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
+pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeOrderBook, StrikeOrderBookManager};
 pub use underlying::{

@@ -34,6 +34,7 @@ rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 crossbeam-skiplist = { workspace = true }
+dashmap = "6.1"
 
 [features]
 default = []
