@@ -409,26 +409,30 @@ impl StrikeOrderBookManager {
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will use this mode.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
     }
 
-    /// Sets the fee schedule for all future option books created by this manager.
+    /// Sets the fee schedule for all future strike books.
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will use this schedule.
+    #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
+    #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
     }

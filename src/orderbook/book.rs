@@ -421,7 +421,7 @@ impl OptionOrderBook {
         } else {
             Err(crate::Error::instrument_not_active(
                 &self.symbol,
-                current.to_string(),
+                current,
             ))
         }
     }

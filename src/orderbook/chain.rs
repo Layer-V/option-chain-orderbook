@@ -161,12 +161,14 @@ impl OptionChainOrderBook {
     ///
     /// Delegates to the underlying [`StrikeOrderBookManager::set_stp_mode`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.strikes.set_stp_mode(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.strikes.stp_mode()
     }
@@ -175,12 +177,14 @@ impl OptionChainOrderBook {
     ///
     /// Delegates to the underlying [`StrikeOrderBookManager::set_fee_schedule`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.strikes.set_fee_schedule(schedule);
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
+    #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.strikes.fee_schedule()
     }
@@ -360,12 +364,14 @@ impl OptionChainOrderBookManager {
     ///
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
     }
@@ -374,12 +380,14 @@ impl OptionChainOrderBookManager {
     ///
     /// Existing chains are not affected. Only newly created chains
     /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
+    #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
     }

@@ -139,12 +139,14 @@ impl UnderlyingOrderBook {
     ///
     /// Delegates to [`ExpirationOrderBookManager::set_stp_mode`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.expirations.set_stp_mode(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.expirations.stp_mode()
     }
@@ -153,12 +155,14 @@ impl UnderlyingOrderBook {
     ///
     /// Delegates to [`ExpirationOrderBookManager::set_fee_schedule`].
     /// Existing books are not affected.
+    #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.expirations.set_fee_schedule(schedule);
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
+    #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.expirations.fee_schedule()
     }
@@ -346,12 +350,14 @@ impl UnderlyingOrderBookManager {
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have this mode propagated.
+    #[inline]
     pub fn set_stp_mode(&self, mode: STPMode) {
         self.stp_mode.set(mode);
     }
 
     /// Returns the current STP mode.
     #[must_use]
+    #[inline]
     pub fn stp_mode(&self) -> STPMode {
         self.stp_mode.get()
     }
@@ -360,12 +366,14 @@ impl UnderlyingOrderBookManager {
     ///
     /// Existing books are not affected. Only newly created books
     /// via [`get_or_create`](Self::get_or_create) will have this schedule propagated.
+    #[inline]
     pub fn set_fee_schedule(&self, schedule: FeeSchedule) {
         self.fee_schedule.set(Some(schedule));
     }
 
     /// Returns the current fee schedule, or `None` if no fees are configured.
     #[must_use]
+    #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
     }
