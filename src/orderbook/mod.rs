@@ -53,6 +53,7 @@ mod expiration;
 mod quote;
 mod strike;
 mod underlying;
+mod validation;
 
 // Re-export all public types
 pub use book::OptionOrderBook;
@@ -63,3 +64,4 @@ pub use strike::{StrikeOrderBook, StrikeOrderBookManager};
 pub use underlying::{
     GlobalStats, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
 };
+pub use validation::ValidationConfig;

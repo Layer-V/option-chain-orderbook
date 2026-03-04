@@ -5,6 +5,7 @@
 
 use super::book::OptionOrderBook;
 use super::quote::Quote;
+use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
@@ -70,6 +71,52 @@ impl StrikeOrderBook {
             strike,
             call: Arc::new(OptionOrderBook::new(call_symbol, OptionStyle::Call)),
             put: Arc::new(OptionOrderBook::new(put_symbol, OptionStyle::Put)),
+            call_greeks: None,
+            put_greeks: None,
+            id: OrderId::new(),
+        }
+    }
+
+    /// Creates a new strike order book with pre-trade validation configured.
+    ///
+    /// The validation config is applied to both call and put order books
+    /// during construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol (e.g., "BTC")
+    /// * `expiration` - The expiration date
+    /// * `strike` - The strike price
+    /// * `config` - Validation configuration for both call and put books
+    #[must_use]
+    pub fn new_with_validation(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        strike: u64,
+        config: &ValidationConfig,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        let exp_str =
+            format_expiration_yyyymmdd(&expiration).unwrap_or_else(|_| expiration.to_string());
+
+        let call_symbol = format!("{}-{}-{}-C", underlying, exp_str, strike);
+        let put_symbol = format!("{}-{}-{}-P", underlying, exp_str, strike);
+
+        Self {
+            underlying,
+            expiration,
+            strike,
+            call: Arc::new(OptionOrderBook::new_with_validation(
+                call_symbol,
+                OptionStyle::Call,
+                config,
+            )),
+            put: Arc::new(OptionOrderBook::new_with_validation(
+                put_symbol,
+                OptionStyle::Put,
+                config,
+            )),
             call_greeks: None,
             put_greeks: None,
             id: OrderId::new(),
@@ -212,6 +259,8 @@ pub struct StrikeOrderBookManager {
     underlying: String,
     /// The expiration date.
     expiration: ExpirationDate,
+    /// Validation config applied to newly created strike books.
+    validation_config: SharedValidationConfig,
 }
 
 impl StrikeOrderBookManager {
@@ -227,7 +276,22 @@ impl StrikeOrderBookManager {
             strikes: SkipMap::new(),
             underlying: underlying.into(),
             expiration,
+            validation_config: SharedValidationConfig::new(),
         }
+    }
+
+    /// Sets the validation config for all future strike books created by this manager.
+    ///
+    /// Existing strike books are not affected. Only newly created books
+    /// via [`get_or_create`](Self::get_or_create) will use this config.
+    pub fn set_validation(&self, config: ValidationConfig) {
+        self.validation_config.set(config);
+    }
+
+    /// Returns the current validation config, if any.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        self.validation_config.get()
     }
 
     /// Returns the underlying asset symbol.
@@ -255,15 +319,27 @@ impl StrikeOrderBookManager {
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
+    ///
+    /// If a validation config has been set via [`set_validation`](Self::set_validation),
+    /// newly created strike books will have that config applied.
     pub fn get_or_create(&self, strike: u64) -> Arc<StrikeOrderBook> {
         if let Some(entry) = self.strikes.get(&strike) {
             return Arc::clone(entry.value());
         }
-        let book = Arc::new(StrikeOrderBook::new(
-            &self.underlying,
-            self.expiration,
-            strike,
-        ));
+        let book = if let Some(ref config) = self.validation_config.get() {
+            Arc::new(StrikeOrderBook::new_with_validation(
+                &self.underlying,
+                self.expiration,
+                strike,
+                config,
+            ))
+        } else {
+            Arc::new(StrikeOrderBook::new(
+                &self.underlying,
+                self.expiration,
+                strike,
+            ))
+        };
         self.strikes.insert(strike, Arc::clone(&book));
         book
     }
@@ -644,5 +720,109 @@ mod tests {
         drop(strike2);
 
         assert_eq!(manager.total_order_count(), 2);
+    }
+
+    #[test]
+    fn test_strike_with_validation_propagates_to_call_and_put() {
+        let config = ValidationConfig::new().with_tick_size(100);
+        let strike = StrikeOrderBook::new_with_validation("BTC", test_expiration(), 50000, &config);
+
+        // Call: valid tick
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        // Call: invalid tick
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+        // Put: valid tick
+        assert!(
+            strike
+                .put()
+                .add_limit_order(OrderId::new(), Side::Buy, 300, 10)
+                .is_ok()
+        );
+        // Put: invalid tick
+        assert!(
+            strike
+                .put()
+                .add_limit_order(OrderId::new(), Side::Buy, 250, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_strike_manager_set_validation_propagates() {
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+
+        let config = ValidationConfig::new().with_tick_size(100);
+        manager.set_validation(config.clone());
+
+        assert_eq!(manager.validation_config(), Some(config));
+
+        // New strike should inherit validation
+        let strike = manager.get_or_create(50000);
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_strike_manager_no_validation_by_default() {
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+
+        assert!(manager.validation_config().is_none());
+
+        let strike = manager.get_or_create(50000);
+        // No validation: any price works
+        assert!(
+            strike
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_strike_manager_existing_strike_unaffected() {
+        let manager = StrikeOrderBookManager::new("BTC", test_expiration());
+
+        // Create strike before setting validation
+        let strike_before = manager.get_or_create(50000);
+
+        // Now set validation
+        manager.set_validation(ValidationConfig::new().with_tick_size(100));
+
+        // Existing strike is NOT affected (any price still works)
+        assert!(
+            strike_before
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_ok()
+        );
+
+        // New strike IS affected
+        let strike_after = manager.get_or_create(55000);
+        assert!(
+            strike_after
+                .call()
+                .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
     }
 }

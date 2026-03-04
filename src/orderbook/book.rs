@@ -4,6 +4,7 @@
 //! OrderBook-rs `OrderBook<T>` implementation with option-specific functionality.
 
 use super::quote::Quote;
+use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{DefaultOrderBook, OrderBookSnapshot, OrderId, Side, TimeInForce};
@@ -64,6 +65,73 @@ impl OptionOrderBook {
             last_quote: Arc::new(Quote::empty(0)),
             option_style,
             id: OrderId::new(),
+        }
+    }
+
+    /// Creates a new option order book with pre-trade validation configured.
+    ///
+    /// Validation rules are applied to the underlying `OrderBook` before it is
+    /// wrapped in `Arc`, so they cannot be changed after construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The option contract symbol (e.g., "BTC-20240329-50000-C")
+    /// * `option_style` - The option style (Call or Put)
+    /// * `config` - Validation configuration (tick size, lot size, min/max order size)
+    #[must_use]
+    pub fn new_with_validation(
+        symbol: impl Into<String>,
+        option_style: OptionStyle,
+        config: &ValidationConfig,
+    ) -> Self {
+        let symbol = symbol.into();
+        let symbol_hash = Self::hash_symbol(&symbol);
+        let mut book = DefaultOrderBook::new(&symbol);
+
+        if let Some(tick) = config.tick_size() {
+            book.set_tick_size(tick);
+        }
+        if let Some(lot) = config.lot_size() {
+            book.set_lot_size(lot);
+        }
+        if let Some(min) = config.min_order_size() {
+            book.set_min_order_size(min);
+        }
+        if let Some(max) = config.max_order_size() {
+            book.set_max_order_size(max);
+        }
+
+        Self {
+            symbol,
+            symbol_hash,
+            book: Arc::new(book),
+            last_quote: Arc::new(Quote::empty(0)),
+            option_style,
+            id: OrderId::new(),
+        }
+    }
+
+    /// Returns the current validation configuration read back from the underlying book,
+    /// or `None` if no validation rules are configured.
+    #[must_use]
+    pub fn validation_config(&self) -> Option<ValidationConfig> {
+        let mut config = ValidationConfig::new();
+        if let Some(tick) = self.book.tick_size() {
+            config = config.with_tick_size(tick);
+        }
+        if let Some(lot) = self.book.lot_size() {
+            config = config.with_lot_size(lot);
+        }
+        if let Some(min) = self.book.min_order_size() {
+            config = config.with_min_order_size(min);
+        }
+        if let Some(max) = self.book.max_order_size() {
+            config = config.with_max_order_size(max);
+        }
+        if config.is_empty() {
+            None
+        } else {
+            Some(config)
         }
     }
 
@@ -614,5 +682,128 @@ mod tests {
         let impact = book.market_impact(5, Side::Buy);
         // avg_price is f64, just verify it's a valid number
         assert!(impact.avg_price >= 0.0 || impact.avg_price < 0.0);
+    }
+
+    #[test]
+    fn test_new_with_validation_tick_size() {
+        let config = ValidationConfig::new().with_tick_size(100);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid price (multiple of 100)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 200, 10)
+                .is_ok()
+        );
+
+        // Invalid price (not a multiple of 100)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 150, 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_new_with_validation_lot_size() {
+        let config = ValidationConfig::new().with_lot_size(10);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid quantity (multiple of 10)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 20)
+                .is_ok()
+        );
+
+        // Invalid quantity (not a multiple of 10)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 15)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_new_with_validation_min_max_order_size() {
+        let config = ValidationConfig::new()
+            .with_min_order_size(5)
+            .with_max_order_size(100);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Valid quantity (within range)
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 50)
+                .is_ok()
+        );
+
+        // Too small
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 2)
+                .is_err()
+        );
+
+        // Too large
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 100, 200)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validation_config_readback() {
+        let config = ValidationConfig::new()
+            .with_tick_size(100)
+            .with_lot_size(10)
+            .with_min_order_size(1)
+            .with_max_order_size(1000);
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        let readback = book.validation_config();
+        assert_eq!(readback, Some(config));
+    }
+
+    #[test]
+    fn test_no_validation_by_default() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert!(book.validation_config().is_none());
+
+        // Any price/quantity should work
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+                .is_ok()
+        );
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 150, 7)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_new_with_empty_validation() {
+        let config = ValidationConfig::new();
+        let book = OptionOrderBook::new_with_validation(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            &config,
+        );
+
+        // Empty config = no validation = anything goes
+        assert!(
+            book.add_limit_order(OrderId::new(), Side::Buy, 1, 1)
+                .is_ok()
+        );
     }
 }
