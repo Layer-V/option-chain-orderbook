@@ -83,7 +83,7 @@ impl StrikeOrderBook {
     }
 
     /// Returns the expiration date.
-    #[must_use]
+    #[must_use = "returns the expiration date without modifying the book"]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
     }
@@ -237,7 +237,7 @@ impl StrikeOrderBookManager {
     }
 
     /// Returns the expiration date.
-    #[must_use]
+    #[must_use = "returns the expiration date without modifying the manager"]
     pub const fn expiration(&self) -> &ExpirationDate {
         &self.expiration
     }
