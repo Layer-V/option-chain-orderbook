@@ -10,6 +10,7 @@ use super::expiration::{
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
+use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
@@ -41,6 +42,10 @@ pub struct UnderlyingOrderBook {
     expirations: ExpirationOrderBookManager,
     /// Instrument registry propagated to expiration managers.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    /// Stored for future use in hierarchy traversal.
+    #[allow(dead_code)]
+    symbol_index: Option<Arc<SymbolIndex>>,
 }
 
 /// Underlying-level mass cancel summary.
@@ -161,6 +166,7 @@ impl UnderlyingOrderBook {
             expirations: ExpirationOrderBookManager::new(&underlying),
             underlying,
             registry: None,
+            symbol_index: None,
         }
     }
 
@@ -174,6 +180,7 @@ impl UnderlyingOrderBook {
     /// * `underlying` - The underlying asset symbol
     /// * `registry` - The instrument registry for ID allocation
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn new_with_registry(
         underlying: impl Into<String>,
         registry: Arc<InstrumentRegistry>,
@@ -187,6 +194,36 @@ impl UnderlyingOrderBook {
             ),
             underlying,
             registry: Some(registry),
+            symbol_index: None,
+        }
+    }
+
+    /// Creates a new underlying order book with both instrument registry and symbol index.
+    ///
+    /// Both are propagated through the hierarchy for ID allocation and symbol lookup.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            expirations: ExpirationOrderBookManager::new_with_registry_and_index(
+                &underlying,
+                Arc::clone(&registry),
+                Arc::clone(&symbol_index),
+            ),
+            underlying,
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
         }
     }
 
@@ -649,6 +686,8 @@ pub struct UnderlyingOrderBookManager {
     underlyings: SkipMap<String, Arc<UnderlyingOrderBook>>,
     /// Shared instrument registry for allocating unique IDs.
     registry: Arc<InstrumentRegistry>,
+    /// Shared symbol index for O(1) lookup by symbol string.
+    symbol_index: Arc<SymbolIndex>,
     /// STP mode propagated to newly created underlying books.
     stp_mode: SharedSTPMode,
     /// Fee schedule propagated to newly created underlying books.
@@ -672,6 +711,7 @@ impl UnderlyingOrderBookManager {
         Self {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new()),
+            symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -691,6 +731,7 @@ impl UnderlyingOrderBookManager {
         Self {
             underlyings: SkipMap::new(),
             registry: Arc::new(InstrumentRegistry::new_with_seed(seed)),
+            symbol_index: Arc::new(SymbolIndex::new()),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -718,9 +759,10 @@ impl UnderlyingOrderBookManager {
         if let Some(entry) = self.underlyings.get(&underlying) {
             return Arc::clone(entry.value());
         }
-        let book = Arc::new(UnderlyingOrderBook::new_with_registry(
+        let book = Arc::new(UnderlyingOrderBook::new_with_registry_and_index(
             &underlying,
             Arc::clone(&self.registry),
+            Arc::clone(&self.symbol_index),
         ));
         let stp = self.stp_mode.get();
         if stp != STPMode::None {
@@ -772,6 +814,42 @@ impl UnderlyingOrderBookManager {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.fee_schedule.get()
+    }
+
+    /// Returns a reference to the symbol index.
+    #[must_use]
+    #[inline]
+    pub fn symbol_index(&self) -> &Arc<SymbolIndex> {
+        &self.symbol_index
+    }
+
+    /// Looks up an [`OptionOrderBook`](super::book::OptionOrderBook) by its symbol string.
+    ///
+    /// This provides O(1) lookup across the entire hierarchy by using the
+    /// symbol index to find the coordinates, then traversing to the target book.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The full option symbol (e.g., "BTC-20260130-50000-C")
+    ///
+    /// # Returns
+    ///
+    /// An `Arc<OptionOrderBook>` reference to the target book.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::SymbolNotFound` if the symbol is not registered.
+    /// Returns hierarchy errors if the underlying/expiration/strike no longer exists.
+    pub fn get_by_symbol(&self, symbol: &str) -> Result<Arc<super::book::OptionOrderBook>> {
+        let sym_ref = self
+            .symbol_index
+            .get(symbol)
+            .ok_or_else(|| Error::symbol_not_found(symbol))?;
+
+        let underlying = self.get(sym_ref.underlying())?;
+        let expiration = underlying.get_expiration(sym_ref.expiration())?;
+        let strike = expiration.get_strike(sym_ref.strike())?;
+        Ok(strike.get_arc(sym_ref.option_style()))
     }
 
     /// Gets an underlying order book.
@@ -2641,5 +2719,142 @@ mod tests {
         let summary = manager.terminal_order_summary_across_underlyings();
         assert_eq!(summary.filled, 2);
         assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_symbol_index_auto_registration() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        let call_symbol = strike.call().symbol().to_string();
+        let put_symbol = strike.put().symbol().to_string();
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        assert_eq!(manager.symbol_index().len(), 2);
+        assert!(manager.symbol_index().contains(&call_symbol));
+        assert!(manager.symbol_index().contains(&put_symbol));
+    }
+
+    #[test]
+    fn test_get_by_symbol_call() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        let call_symbol = strike.call().symbol().to_string();
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let result = manager.get_by_symbol(&call_symbol);
+        assert!(result.is_ok());
+        let book = result.expect("should find call");
+        assert_eq!(book.symbol(), call_symbol);
+    }
+
+    #[test]
+    fn test_get_by_symbol_put() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        let put_symbol = strike.put().symbol().to_string();
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let result = manager.get_by_symbol(&put_symbol);
+        assert!(result.is_ok());
+        let book = result.expect("should find put");
+        assert_eq!(book.symbol(), put_symbol);
+    }
+
+    #[test]
+    fn test_get_by_symbol_not_found() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let result = manager.get_by_symbol("BTC-20260130-50000-C");
+        assert!(result.is_err());
+        match result {
+            Err(err) => assert!(err.to_string().contains("symbol not found")),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn test_symbol_index_deregistration_on_strike_remove() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        let call_symbol = strike.call().symbol().to_string();
+        let put_symbol = strike.put().symbol().to_string();
+        drop(strike);
+
+        assert_eq!(manager.symbol_index().len(), 2);
+
+        exp.chain().strikes().remove(50000);
+        drop(exp);
+        drop(btc);
+
+        assert_eq!(manager.symbol_index().len(), 0);
+        assert!(!manager.symbol_index().contains(&call_symbol));
+        assert!(!manager.symbol_index().contains(&put_symbol));
+    }
+
+    #[test]
+    fn test_symbol_index_multiple_strikes() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let s1 = exp.get_or_create_strike(45000);
+        let s2 = exp.get_or_create_strike(50000);
+        let s3 = exp.get_or_create_strike(55000);
+        let s1_call = s1.call().symbol().to_string();
+        let s2_put = s2.put().symbol().to_string();
+        let s3_call = s3.call().symbol().to_string();
+        drop(s1);
+        drop(s2);
+        drop(s3);
+        drop(exp);
+        drop(btc);
+
+        assert_eq!(manager.symbol_index().len(), 6);
+        assert!(manager.symbol_index().contains(&s1_call));
+        assert!(manager.symbol_index().contains(&s2_put));
+        assert!(manager.symbol_index().contains(&s3_call));
+    }
+
+    #[test]
+    fn test_symbol_index_multiple_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let btc_strike = exp.get_or_create_strike(50000);
+        let btc_call = btc_strike.call().symbol().to_string();
+        drop(btc_strike);
+        drop(exp);
+        drop(btc);
+
+        let eth = manager.get_or_create("ETH");
+        let exp2 = eth.get_or_create_expiration(test_expiration());
+        let eth_strike = exp2.get_or_create_strike(3000);
+        let eth_put = eth_strike.put().symbol().to_string();
+        drop(eth_strike);
+        drop(exp2);
+        drop(eth);
+
+        assert_eq!(manager.symbol_index().len(), 4);
+        assert!(manager.symbol_index().contains(&btc_call));
+        assert!(manager.symbol_index().contains(&eth_put));
     }
 }

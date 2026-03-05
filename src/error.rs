@@ -169,6 +169,13 @@ pub enum Error {
         /// Reason for the error.
         reason: String,
     },
+
+    /// Error when a symbol is not found in the index.
+    #[error("symbol not found: {symbol}")]
+    SymbolNotFound {
+        /// The symbol that was not found.
+        symbol: String,
+    },
 }
 
 impl Error {
@@ -330,6 +337,14 @@ impl Error {
             reason: reason.into(),
         }
     }
+
+    /// Creates a new symbol not found error.
+    #[must_use]
+    pub fn symbol_not_found(symbol: impl Into<String>) -> Self {
+        Self::SymbolNotFound {
+            symbol: symbol.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -476,5 +491,13 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("BTC-bad-symbol"));
         assert!(msg.contains("expected format"));
+    }
+
+    #[test]
+    fn test_symbol_not_found_error() {
+        let err = Error::symbol_not_found("BTC-20260130-50000-C");
+        let msg = err.to_string();
+        assert!(msg.contains("symbol not found"));
+        assert!(msg.contains("BTC-20260130-50000-C"));
     }
 }
