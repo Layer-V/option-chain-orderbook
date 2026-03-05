@@ -1239,4 +1239,118 @@ mod tests {
                 .is_err()
         );
     }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_expiration_find_order() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let order_id = OrderId::new();
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+
+        let result = book.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_expiration_find_order_not_found() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let result = book.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_expiration_total_active_orders() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add put");
+        drop(strike);
+
+        assert_eq!(book.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_expiration_orders_by_user() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        strike
+            .put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+            .expect("add b1");
+        drop(strike);
+
+        let a_orders = book.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = book.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_expiration_terminal_order_summary() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_expiration_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = book.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
+    }
 }

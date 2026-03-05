@@ -2438,4 +2438,208 @@ mod tests {
         // Result should have the correct symbol
         assert!(result.symbol.contains("BTC"));
     }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_underlying_find_order() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let order_id = OrderId::new();
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+        drop(exp);
+
+        let result = book.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_underlying_find_order_not_found() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let result = book.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_underlying_total_active_orders() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add put");
+        drop(strike);
+        drop(exp);
+
+        assert_eq!(book.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_underlying_orders_by_user() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        strike
+            .put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+            .expect("add b1");
+        drop(strike);
+        drop(exp);
+
+        let a_orders = book.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = book.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_underlying_terminal_order_summary() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_underlying_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = book.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
+    }
+
+    #[test]
+    fn test_manager_find_order_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+        let order_id = OrderId::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let result = manager.find_order_across_underlyings(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_manager_find_order_across_underlyings_not_found() {
+        let manager = UnderlyingOrderBookManager::new();
+        let result = manager.find_order_across_underlyings(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_manager_total_active_orders_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add btc");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let eth = manager.get_or_create("ETH");
+        let exp2 = eth.get_or_create_expiration(test_expiration());
+        let strike2 = exp2.get_or_create_strike(3000);
+        strike2
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 200, 5)
+            .expect("add eth");
+        drop(strike2);
+        drop(exp2);
+        drop(eth);
+
+        assert_eq!(manager.total_active_orders_across_underlyings(), 2);
+    }
+
+    #[test]
+    fn test_manager_terminal_order_summary_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let summary = manager.terminal_order_summary_across_underlyings();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
 }

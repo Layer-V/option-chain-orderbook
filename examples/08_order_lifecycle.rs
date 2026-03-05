@@ -73,7 +73,7 @@ fn main() {
         summary.filled, summary.cancelled, summary.rejected
     );
 
-    // Check order1 status after partial fill
+    // Check order1 status after match
     if let Some(status) = book.get_order_status(order1) {
         println!("\nOrder 1 status after match: {:?}", status);
     }

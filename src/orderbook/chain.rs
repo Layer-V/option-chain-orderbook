@@ -1311,4 +1311,114 @@ mod tests {
                 .is_err()
         );
     }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_chain_find_order_across_strikes() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let order_id = OrderId::new();
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(s1);
+
+        let result = chain.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_chain_find_order_not_found() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let result = chain.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_chain_total_active_orders() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add s1");
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        s2.put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add s2");
+        drop(s2);
+
+        assert_eq!(chain.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_chain_orders_by_user() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        s2.put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        s2.call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 90, 5, user_b)
+            .expect("add b1");
+        drop(s2);
+
+        let a_orders = chain.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = chain.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_chain_terminal_order_summary() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(s1);
+
+        let summary = chain.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_chain_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(s1);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = chain.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
+    }
 }

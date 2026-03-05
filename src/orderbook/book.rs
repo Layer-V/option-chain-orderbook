@@ -35,6 +35,10 @@ pub(crate) struct BookConfig {
     /// Optional fee schedule for maker/taker fees.
     pub fee_schedule: Option<FeeSchedule>,
     /// Whether to enable order state tracking (default: true).
+    ///
+    /// Enabling state tracking introduces a small overhead per order operation
+    /// due to status recording. For extreme low-latency scenarios where every
+    /// microsecond matters, set this to `false` to disable tracking entirely.
     pub enable_state_tracking: bool,
 }
 
@@ -236,7 +240,9 @@ impl OptionOrderBook {
 
             let mut tracker = OrderStateTracker::new();
             tracker.set_listener(Arc::new(move |_id, _old, new| {
-                // Only count transitions INTO terminal states
+                // Count when reaching terminal states. The upstream tracker
+                // currently emits one transition per order, so double-counting
+                // is not a concern with the current orderbook-rs behavior.
                 if new.is_terminal() {
                     counters_clone.increment(new);
                 }
@@ -2673,7 +2679,7 @@ mod tests {
             .expect("add taker");
         assert_eq!(book.terminal_order_count(), 2);
 
-        // Sleep briefly and purge with zero duration (should purge all)
+        // Sleep briefly and purge with a small duration (should purge all)
         thread::sleep(Duration::from_millis(10));
         let purged = book.purge_terminal_states(Duration::from_millis(1));
         assert_eq!(purged, 2);
