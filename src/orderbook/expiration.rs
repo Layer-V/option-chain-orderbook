@@ -13,9 +13,12 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, STPMode, Side};
+use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Order book for a single expiration date.
 ///
@@ -320,6 +323,120 @@ impl ExpirationOrderBook {
         Ok(ExpirationMassCancelResult {
             per_child: vec![(self.expiration.to_string(), result)],
         })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this expiration's chain.
+    ///
+    /// # Description
+    ///
+    /// Delegates to the underlying chain. Returns the option symbol and
+    /// current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        self.chain.find_order(order_id)
+    }
+
+    /// Returns the total number of active orders in the chain.
+    ///
+    /// # Description
+    ///
+    /// Delegates to the underlying chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.chain.total_active_orders()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to the underlying chain and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.chain.purge_terminal_states(older_than)
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Delegates to the underlying chain. Returns tuples of
+    /// (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        self.chain.orders_by_user(user_id)
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Delegates to the underlying chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.chain.terminal_order_summary()
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -1121,5 +1238,119 @@ mod tests {
                 .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
                 .is_err()
         );
+    }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_expiration_find_order() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let order_id = OrderId::new();
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+
+        let result = book.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_expiration_find_order_not_found() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let result = book.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_expiration_total_active_orders() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add put");
+        drop(strike);
+
+        assert_eq!(book.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_expiration_orders_by_user() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        strike
+            .put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+            .expect("add b1");
+        drop(strike);
+
+        let a_orders = book.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = book.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_expiration_terminal_order_summary() {
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_expiration_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let book = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let strike = book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = book.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
     }
 }

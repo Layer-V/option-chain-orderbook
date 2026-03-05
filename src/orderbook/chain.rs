@@ -12,9 +12,12 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, STPMode, Side};
+use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Option chain order book for a single expiration.
 ///
@@ -375,6 +378,137 @@ impl OptionChainOrderBook {
         }
 
         Ok(ChainMassCancelResult { per_child })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this chain's strikes.
+    ///
+    /// # Description
+    ///
+    /// Searches all strikes for the specified order. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        for entry in self.strikes.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all strikes.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all strikes in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all strikes and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches all strikes for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        self.strikes
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all strikes.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
     }
 
     /// Returns the ATM strike closest to the given spot price.
@@ -1176,5 +1310,115 @@ mod tests {
                 .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
                 .is_err()
         );
+    }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_chain_find_order_across_strikes() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let order_id = OrderId::new();
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(s1);
+
+        let result = chain.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_chain_find_order_not_found() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let result = chain.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_chain_total_active_orders() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add s1");
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        s2.put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add s2");
+        drop(s2);
+
+        assert_eq!(chain.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_chain_orders_by_user() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        s2.put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        s2.call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 90, 5, user_b)
+            .expect("add b1");
+        drop(s2);
+
+        let a_orders = chain.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = chain.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_chain_terminal_order_summary() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(s1);
+
+        let summary = chain.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_chain_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        s1.call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(s1);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = chain.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
     }
 }

@@ -9,21 +9,22 @@ use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{
-    DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, STPMode, Side,
-    TimeInForce, TradeResult,
+    DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, OrderStateTracker,
+    OrderStatus, STPMode, Side, TimeInForce, TradeResult,
 };
 use pricelevel::{Hash32, MatchResult};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Internal configuration for constructing an [`OptionOrderBook`].
 ///
 /// Consolidates all optional configuration (instrument ID, validation,
 /// STP mode, fee schedule) into a single struct, avoiding constructor
 /// explosion as new features are added.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct BookConfig {
     /// Numeric instrument ID (0 for standalone books).
     pub instrument_id: u32,
@@ -33,6 +34,113 @@ pub(crate) struct BookConfig {
     pub stp_mode: STPMode,
     /// Optional fee schedule for maker/taker fees.
     pub fee_schedule: Option<FeeSchedule>,
+    /// Whether to enable order state tracking (default: true).
+    ///
+    /// Enabling state tracking introduces a small overhead per order operation
+    /// due to status recording. For extreme low-latency scenarios where every
+    /// microsecond matters, set this to `false` to disable tracking entirely.
+    pub enable_state_tracking: bool,
+}
+
+impl Default for BookConfig {
+    fn default() -> Self {
+        Self {
+            instrument_id: 0,
+            validation: None,
+            stp_mode: STPMode::None,
+            fee_schedule: None,
+            enable_state_tracking: true,
+        }
+    }
+}
+
+/// Cumulative counts of terminal order transitions.
+///
+/// These counts represent the lifetime totals of orders that have transitioned
+/// to each terminal state. They are not adjusted when terminal states are
+/// purged or evicted from the tracker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalOrderSummary {
+    /// Number of orders that reached the Filled state.
+    pub filled: usize,
+    /// Number of orders that reached the Cancelled state.
+    pub cancelled: usize,
+    /// Number of orders that reached the Rejected state.
+    pub rejected: usize,
+}
+
+impl TerminalOrderSummary {
+    /// Returns the total number of terminal orders.
+    #[must_use]
+    #[inline]
+    pub fn total(&self) -> usize {
+        self.filled
+            .saturating_add(self.cancelled)
+            .saturating_add(self.rejected)
+    }
+}
+
+impl std::ops::Add for TerminalOrderSummary {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            filled: self.filled.saturating_add(other.filled),
+            cancelled: self.cancelled.saturating_add(other.cancelled),
+            rejected: self.rejected.saturating_add(other.rejected),
+        }
+    }
+}
+
+impl std::iter::Sum for TerminalOrderSummary {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |acc, x| acc + x)
+    }
+}
+
+/// Internal atomic counters for terminal state tracking via listener.
+pub(crate) struct TerminalCounters {
+    filled: AtomicUsize,
+    cancelled: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+impl TerminalCounters {
+    /// Creates a new set of zero-initialized counters.
+    pub fn new() -> Self {
+        Self {
+            filled: AtomicUsize::new(0),
+            cancelled: AtomicUsize::new(0),
+            rejected: AtomicUsize::new(0),
+        }
+    }
+
+    /// Increments the appropriate counter based on the order status.
+    #[inline]
+    pub fn increment(&self, status: &OrderStatus) {
+        match status {
+            OrderStatus::Filled { .. } => {
+                self.filled.fetch_add(1, Ordering::Relaxed);
+            }
+            OrderStatus::Cancelled { .. } => {
+                self.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
+            OrderStatus::Rejected { .. } => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns a snapshot of the current counts.
+    #[must_use]
+    pub fn snapshot(&self) -> TerminalOrderSummary {
+        TerminalOrderSummary {
+            filled: self.filled.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Order book for a single option contract.
@@ -78,6 +186,10 @@ pub struct OptionOrderBook {
     /// Populated by the internal trade listener when a matching occurs.
     /// Used by the `_full` order methods to return [`TradeResult`].
     last_trade_result: Arc<Mutex<Option<TradeResult>>>,
+    /// Cumulative terminal order counters maintained by the state listener.
+    ///
+    /// `None` when state tracking is disabled via `BookConfig`.
+    terminal_counters: Option<Arc<TerminalCounters>>,
 }
 
 impl OptionOrderBook {
@@ -121,6 +233,26 @@ impl OptionOrderBook {
             *guard = Some(tr.clone());
         }));
 
+        // Install order state tracker for lifecycle tracking (enabled by default)
+        let terminal_counters = if config.enable_state_tracking {
+            let counters = Arc::new(TerminalCounters::new());
+            let counters_clone = Arc::clone(&counters);
+
+            let mut tracker = OrderStateTracker::new();
+            tracker.set_listener(Arc::new(move |_id, _old, new| {
+                // Count when reaching terminal states. The upstream tracker
+                // currently emits one transition per order, so double-counting
+                // is not a concern with the current orderbook-rs behavior.
+                if new.is_terminal() {
+                    counters_clone.increment(new);
+                }
+            }));
+            book.set_order_state_tracker(tracker);
+            Some(counters)
+        } else {
+            None
+        };
+
         Self {
             symbol,
             symbol_hash,
@@ -131,6 +263,7 @@ impl OptionOrderBook {
             status: AtomicU8::new(InstrumentStatus::Active as u8),
             instrument_id: AtomicU32::new(config.instrument_id),
             last_trade_result: capture,
+            terminal_counters,
         }
     }
 
@@ -827,6 +960,235 @@ impl OptionOrderBook {
     /// ```
     pub fn cancel_by_user(&self, user_id: Hash32) -> Result<MassCancelResult> {
         Ok(self.book.cancel_orders_by_user(user_id))
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Returns the current lifecycle status of an order.
+    ///
+    /// # Description
+    ///
+    /// Queries the order state tracker for the current status of the specified
+    /// order. Returns `None` if state tracking is disabled, or if the order
+    /// was never submitted to this book.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to query.
+    ///
+    /// # Returns
+    ///
+    /// The current [`OrderStatus`] if the order is tracked, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// let id = OrderId::new();
+    /// book.add_limit_order(id, Side::Buy, 100, 10).expect("add order");
+    /// let status = book.get_order_status(id);
+    /// assert!(status.is_some());
+    /// ```
+    #[must_use]
+    pub fn get_order_status(&self, order_id: OrderId) -> Option<OrderStatus> {
+        self.book.order_status(order_id)
+    }
+
+    /// Returns the full transition history for an order.
+    ///
+    /// # Description
+    ///
+    /// Each entry is a `(timestamp_ns, OrderStatus)` pair in chronological
+    /// order. Returns `None` if state tracking is disabled, or if the order
+    /// was never submitted to this book.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to query.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(timestamp_ns, OrderStatus)` pairs, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// let id = OrderId::new();
+    /// book.add_limit_order(id, Side::Buy, 100, 10).expect("add order");
+    /// let history = book.get_order_history(id);
+    /// assert!(history.is_some());
+    /// ```
+    #[must_use]
+    pub fn get_order_history(&self, order_id: OrderId) -> Option<Vec<(u64, OrderStatus)>> {
+        self.book.get_order_history(order_id)
+    }
+
+    /// Returns the number of orders currently in an active state.
+    ///
+    /// # Description
+    ///
+    /// Active orders are those in `Open` or `PartiallyFilled` status. Returns
+    /// `0` if state tracking is disabled.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// The count of active (resting) orders.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn active_order_count(&self) -> usize {
+        self.book.active_order_count()
+    }
+
+    /// Returns the number of orders currently in a terminal state.
+    ///
+    /// # Description
+    ///
+    /// Terminal orders are those in `Filled`, `Cancelled`, or `Rejected` status
+    /// that are still retained by the tracker. Returns `0` if state tracking
+    /// is disabled.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// The count of terminal orders retained in the tracker.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_count(&self) -> usize {
+        self.book.terminal_order_count()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Active orders (`Open`, `PartiallyFilled`) are never purged. This is
+    /// useful for bounded memory management in long-running processes.
+    /// Returns `0` if state tracking is disabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries with a last-transition timestamp older than
+    ///   `now - older_than` are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.book.purge_terminal_states(older_than)
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// The counts represent cumulative lifetime totals of orders that have
+    /// transitioned to each terminal state. They are not adjusted when
+    /// terminal states are purged or evicted from the tracker.
+    ///
+    /// Returns a zeroed summary if state tracking is disabled.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with filled, cancelled, and rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.terminal_counters
+            .as_ref()
+            .map(|c| c.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches the order book for resting orders belonging to the specified
+    /// user and returns their IDs with current status. Only active (resting)
+    /// orders are returned; terminal orders cannot be queried by user because
+    /// the tracker does not index by user ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(OrderId, OrderStatus)` pairs for active orders belonging
+    /// to the user.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    /// use pricelevel::Hash32;
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// let user = Hash32::from([1u8; 32]);
+    /// book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user)
+    ///     .expect("add order");
+    /// let orders = book.orders_by_user(user);
+    /// assert_eq!(orders.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(OrderId, OrderStatus)> {
+        self.book
+            .get_all_orders()
+            .into_iter()
+            .filter(|order| order.user_id() == user_id)
+            .map(|order| {
+                let id = order.id();
+                let status = self.book.order_status(id).unwrap_or(OrderStatus::Open);
+                (id, status)
+            })
+            .collect()
     }
 
     /// Returns the current best quote.
@@ -1998,6 +2360,7 @@ mod tests {
                 validation: Some(config),
                 stp_mode: STPMode::CancelTaker,
                 fee_schedule: Some(schedule),
+                enable_state_tracking: true,
             },
         );
         assert_eq!(book.instrument_id(), 42);
@@ -2192,5 +2555,153 @@ mod tests {
         };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
+    }
+
+    // ── Order lifecycle tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_get_order_status_returns_open_for_resting_order() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add order");
+        let status = book.get_order_status(id);
+        assert!(status.is_some());
+        assert!(matches!(status, Some(OrderStatus::Open)));
+    }
+
+    #[test]
+    fn test_get_order_status_returns_filled_after_full_match() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let maker_id = OrderId::new();
+        let taker_id = OrderId::new();
+        book.add_limit_order(maker_id, Side::Sell, 100, 10)
+            .expect("add maker");
+        book.add_limit_order(taker_id, Side::Buy, 100, 10)
+            .expect("add taker");
+        // Maker should be filled
+        let maker_status = book.get_order_status(maker_id);
+        assert!(matches!(maker_status, Some(OrderStatus::Filled { .. })));
+    }
+
+    #[test]
+    fn test_get_order_history_returns_transitions() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add order");
+        let history = book.get_order_history(id);
+        assert!(history.is_some());
+        let h = history.expect("history");
+        assert!(!h.is_empty());
+        // First transition should be to Open
+        assert!(matches!(h[0].1, OrderStatus::Open));
+    }
+
+    #[test]
+    fn test_active_order_count_tracks_resting_orders() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.active_order_count(), 0);
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add order");
+        assert_eq!(book.active_order_count(), 1);
+        book.add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+            .expect("add order");
+        assert_eq!(book.active_order_count(), 2);
+    }
+
+    #[test]
+    fn test_terminal_order_count_tracks_filled_orders() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        assert_eq!(book.terminal_order_count(), 0);
+        // Add and match orders
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        // Both should be filled (terminal)
+        assert_eq!(book.terminal_order_count(), 2);
+    }
+
+    #[test]
+    fn test_terminal_order_summary_counts_filled() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.cancelled, 0);
+        assert_eq!(summary.rejected, 0);
+    }
+
+    #[test]
+    fn test_terminal_order_summary_counts_cancelled() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add order");
+        book.cancel_order(id).expect("cancel");
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 0);
+        assert_eq!(summary.cancelled, 1);
+        assert_eq!(summary.rejected, 0);
+    }
+
+    #[test]
+    fn test_orders_by_user_returns_user_orders() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 99, 5, user_a)
+            .expect("add a2");
+        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 10, user_b)
+            .expect("add b1");
+        let a_orders = book.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+        let b_orders = book.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_purge_terminal_states_removes_old_entries() {
+        use std::thread;
+        use std::time::Duration;
+
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        // Add and match to create terminal states
+        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        assert_eq!(book.terminal_order_count(), 2);
+
+        // Sleep briefly and purge with a small duration (should purge all)
+        thread::sleep(Duration::from_millis(10));
+        let purged = book.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
+        assert_eq!(book.terminal_order_count(), 0);
+    }
+
+    #[test]
+    fn test_state_tracking_disabled_returns_none() {
+        let book = OptionOrderBook::new_with_config(
+            "BTC-20240329-50000-C",
+            OptionStyle::Call,
+            BookConfig {
+                enable_state_tracking: false,
+                ..BookConfig::default()
+            },
+        );
+        let id = OrderId::new();
+        book.add_limit_order(id, Side::Buy, 100, 10)
+            .expect("add order");
+        // Status should be None when tracking disabled
+        assert!(book.get_order_status(id).is_none());
+        assert_eq!(book.active_order_count(), 0);
+        assert_eq!(book.terminal_order_count(), 0);
     }
 }

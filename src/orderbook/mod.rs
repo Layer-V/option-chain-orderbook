@@ -61,7 +61,7 @@ mod underlying;
 mod validation;
 
 // Re-export all public types
-pub use book::OptionOrderBook;
+pub use book::{OptionOrderBook, TerminalOrderSummary};
 pub use chain::{
     ChainMassCancelResult, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
 };
@@ -81,5 +81,8 @@ pub use underlying::{
 pub use validation::ValidationConfig;
 
 // Re-export upstream types used in the public API
-pub use orderbook_rs::{FeeSchedule, MassCancelResult, STPMode, TradeResult};
+pub use orderbook_rs::{
+    CancelReason, FeeSchedule, MassCancelResult, OrderStateTracker, OrderStatus, STPMode,
+    TradeResult,
+};
 pub use pricelevel::Hash32;

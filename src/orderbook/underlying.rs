@@ -14,9 +14,12 @@ use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, STPMode, Side};
+use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Order book for a single underlying asset.
 ///
@@ -452,6 +455,137 @@ impl UnderlyingOrderBook {
         Ok(UnderlyingMassCancelResult { per_child })
     }
 
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this underlying's expirations.
+    ///
+    /// # Description
+    ///
+    /// Searches all expirations for the specified order. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        for entry in self.expirations.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all expirations.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all expirations.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all expirations and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches all expirations for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        self.expirations
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all expirations.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
+    }
+
     /// Returns the total strike count across all expirations.
     #[must_use]
     pub fn total_strike_count(&self) -> usize {
@@ -827,6 +961,148 @@ impl UnderlyingOrderBookManager {
         }
 
         Ok(GlobalMassCancelResult { per_child })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Searches all underlyings for the specified order. Returns the option
+    /// symbol and current status if found. Complexity is O(U × E × S) in the
+    /// worst case.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order_across_underlyings(
+        &self,
+        order_id: OrderId,
+    ) -> Option<(String, OrderStatus)> {
+        for entry in self.underlyings.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all underlyings.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders_across_underlyings(&self) -> usize {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all underlyings and returns the total purged.
+    /// Complexity is O(U × E × S) where U is the number of underlyings,
+    /// E expirations, and S strikes.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states_across_underlyings(&self, older_than: Duration) -> usize {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Searches all underlyings for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status). Complexity is
+    /// O(U × E × S) where U is the number of underlyings, E expirations,
+    /// and S strikes.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user_across_underlyings(
+        &self,
+        user_id: Hash32,
+    ) -> Vec<(String, OrderId, OrderStatus)> {
+        self.underlyings
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all underlyings.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary_across_underlyings(&self) -> TerminalOrderSummary {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
     }
 
     /// Returns the total expiration count across all underlyings.
@@ -2161,5 +2437,209 @@ mod tests {
         assert_eq!(strike.call().order_count(), 0);
         // Result should have the correct symbol
         assert!(result.symbol.contains("BTC"));
+    }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_underlying_find_order() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let order_id = OrderId::new();
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+        drop(exp);
+
+        let result = book.find_order(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_underlying_find_order_not_found() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let result = book.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_underlying_total_active_orders() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add put");
+        drop(strike);
+        drop(exp);
+
+        assert_eq!(book.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_underlying_orders_by_user() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        strike
+            .put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+            .expect("add b1");
+        drop(strike);
+        drop(exp);
+
+        let a_orders = book.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = book.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_underlying_terminal_order_summary() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+
+        let summary = book.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_underlying_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = book.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
+    }
+
+    #[test]
+    fn test_manager_find_order_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+        let order_id = OrderId::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let result = manager.find_order_across_underlyings(order_id);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_manager_find_order_across_underlyings_not_found() {
+        let manager = UnderlyingOrderBookManager::new();
+        let result = manager.find_order_across_underlyings(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_manager_total_active_orders_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add btc");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let eth = manager.get_or_create("ETH");
+        let exp2 = eth.get_or_create_expiration(test_expiration());
+        let strike2 = exp2.get_or_create_strike(3000);
+        strike2
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 200, 5)
+            .expect("add eth");
+        drop(strike2);
+        drop(exp2);
+        drop(eth);
+
+        assert_eq!(manager.total_active_orders_across_underlyings(), 2);
+    }
+
+    #[test]
+    fn test_manager_terminal_order_summary_across_underlyings() {
+        let manager = UnderlyingOrderBookManager::new();
+
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(test_expiration());
+        let strike = exp.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+        drop(strike);
+        drop(exp);
+        drop(btc);
+
+        let summary = manager.terminal_order_summary_across_underlyings();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
     }
 }
