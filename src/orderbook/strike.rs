@@ -1342,6 +1342,123 @@ mod tests {
     }
 
     #[test]
+    fn test_strike_cancel_all() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 60, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 2);
+
+        let result = match strike.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 0);
+    }
+
+    #[test]
+    fn test_strike_cancel_by_side() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 3);
+
+        let result = match strike.cancel_by_side(Side::Buy) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 1);
+    }
+
+    #[test]
+    fn test_strike_cancel_by_user() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 3);
+
+        let result = match strike.cancel_by_user(user_a) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 1);
+    }
+
+    #[test]
+    fn test_strike_cancel_all_empty() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        let result = match strike.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 0);
+        assert_eq!(result.books_affected(), 0);
+    }
+
+    #[test]
     fn test_strike_manager_existing_strike_unaffected() {
         let manager = StrikeOrderBookManager::new("BTC", test_expiration());
 

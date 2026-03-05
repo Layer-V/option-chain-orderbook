@@ -1026,6 +1026,101 @@ mod tests {
     }
 
     #[test]
+    fn test_underlying_cancel_all() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp1 = book.get_or_create_expiration(test_expiration());
+        let s1 = exp1.get_or_create_strike(50000);
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+        drop(exp1);
+
+        let exp2 = book.get_or_create_expiration(ExpirationDate::Days(pos_or_panic!(60.0)));
+        let s2 = exp2.get_or_create_strike(52000);
+        if let Err(err) = s2.put().add_limit_order(OrderId::new(), Side::Sell, 60, 5) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+        drop(exp2);
+
+        assert_eq!(book.total_order_count(), 2);
+
+        let result = match book.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(book.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_underlying_cancel_by_side() {
+        let book = UnderlyingOrderBook::new("BTC");
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let s = exp.get_or_create_strike(50000);
+        if let Err(err) = s.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = s.call().add_limit_order(OrderId::new(), Side::Sell, 110, 5) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s);
+        drop(exp);
+
+        assert_eq!(book.total_order_count(), 2);
+
+        let result = match book.cancel_by_side(Side::Sell) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 1);
+        assert_eq!(book.total_order_count(), 1);
+    }
+
+    #[test]
+    fn test_underlying_cancel_by_user() {
+        let book = UnderlyingOrderBook::new("BTC");
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let exp = book.get_or_create_expiration(test_expiration());
+        let s = exp.get_or_create_strike(50000);
+        if let Err(err) =
+            s.call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            s.put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s);
+        drop(exp);
+
+        assert_eq!(book.total_order_count(), 2);
+
+        let result = match book.cancel_by_user(user_a) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 1);
+        assert_eq!(book.total_order_count(), 1);
+    }
+
+    #[test]
     fn test_underlying_order_book_creation() {
         let book = UnderlyingOrderBook::new("BTC");
 

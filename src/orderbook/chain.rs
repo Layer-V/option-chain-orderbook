@@ -755,6 +755,7 @@ mod tests {
     use super::*;
     use optionstratlib::prelude::pos_or_panic;
     use orderbook_rs::{OrderId, Side};
+    use pricelevel::Hash32;
 
     fn test_expiration() -> ExpirationDate {
         ExpirationDate::Days(pos_or_panic!(30.0))
@@ -1034,6 +1035,117 @@ mod tests {
                 .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_chain_cancel_all() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = s1.put().add_limit_order(OrderId::new(), Side::Sell, 60, 5) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        if let Err(err) = s2.call().add_limit_order(OrderId::new(), Side::Buy, 80, 10) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+
+        assert_eq!(chain.total_order_count(), 3);
+
+        let result = match chain.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 3);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(chain.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_chain_cancel_by_side() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+
+        let s1 = chain.get_or_create_strike(50000);
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        if let Err(err) = s2.put().add_limit_order(OrderId::new(), Side::Buy, 50, 10) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+
+        assert_eq!(chain.total_order_count(), 3);
+
+        let result = match chain.cancel_by_side(Side::Buy) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(chain.total_order_count(), 1);
+    }
+
+    #[test]
+    fn test_chain_cancel_by_user() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let s1 = chain.get_or_create_strike(50000);
+        if let Err(err) =
+            s1.call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        let s2 = chain.get_or_create_strike(52000);
+        if let Err(err) =
+            s2.put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            s2.call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 80, 10, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+
+        assert_eq!(chain.total_order_count(), 3);
+
+        let result = match chain.cancel_by_user(user_a) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(chain.total_order_count(), 1);
     }
 
     #[test]
