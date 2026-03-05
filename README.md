@@ -184,6 +184,7 @@ The library includes comprehensive examples demonstrating each level of the hier
 | `04_expiration_orderbook` | Expiration level with term structure |
 | `05_underlying_orderbook` | Underlying level (all expirations) |
 | `06_full_hierarchy` | Complete hierarchy with trading scenarios |
+| `07_mass_cancel` | Hierarchical mass cancel operations |
 
 Run examples with:
 ```bash

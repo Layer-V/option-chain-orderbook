@@ -210,7 +210,7 @@ impl ExpirationOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -252,7 +252,7 @@ impl ExpirationOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -296,7 +296,7 @@ impl ExpirationOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///

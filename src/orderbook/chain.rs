@@ -254,7 +254,7 @@ impl OptionChainOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -300,7 +300,7 @@ impl OptionChainOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -347,7 +347,7 @@ impl OptionChainOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///

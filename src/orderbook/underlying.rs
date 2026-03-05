@@ -334,7 +334,7 @@ impl UnderlyingOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -378,7 +378,7 @@ impl UnderlyingOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -424,7 +424,7 @@ impl UnderlyingOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -691,7 +691,9 @@ impl UnderlyingOrderBookManager {
     /// # Description
     ///
     /// Cancels every resting order across all underlyings and returns the
-    /// aggregated cancellation details.
+    /// aggregated cancellation details. Complexity is O(U × E × S) where U is
+    /// the number of underlyings, E expirations per underlying, and S strikes
+    /// per expiration.
     ///
     /// # Arguments
     ///
@@ -704,7 +706,7 @@ impl UnderlyingOrderBookManager {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -735,7 +737,8 @@ impl UnderlyingOrderBookManager {
     /// # Description
     ///
     /// Cancels every resting order on the provided side across all underlyings
-    /// and returns the aggregated cancellation details.
+    /// and returns the aggregated cancellation details. Complexity is O(U × E × S)
+    /// where U is the number of underlyings, E expirations, and S strikes.
     ///
     /// # Arguments
     ///
@@ -748,7 +751,7 @@ impl UnderlyingOrderBookManager {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -781,6 +784,8 @@ impl UnderlyingOrderBookManager {
     ///
     /// Cancels every resting order attributed to the provided user identifier
     /// across all underlyings and returns the aggregated cancellation details.
+    /// Complexity is O(U × E × S) where U is the number of underlyings,
+    /// E expirations, and S strikes.
     ///
     /// # Arguments
     ///
@@ -793,7 +798,7 @@ impl UnderlyingOrderBookManager {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///

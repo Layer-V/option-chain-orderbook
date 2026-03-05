@@ -293,7 +293,7 @@ impl StrikeOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -339,7 +339,7 @@ impl StrikeOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -387,7 +387,7 @@ impl StrikeOrderBook {
     ///
     /// # Errors
     ///
-    /// Propagates any underlying cancellation errors.
+    /// None.
     ///
     /// # Examples
     ///
@@ -505,7 +505,7 @@ impl StrikeMassCancelResult {
     pub fn books_affected(&self) -> usize {
         self.per_book
             .iter()
-            .filter(|(_, result)| !result.is_empty())
+            .filter(|(_, result)| result.cancelled_count() > 0)
             .count()
     }
 
