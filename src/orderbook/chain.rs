@@ -12,9 +12,12 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, STPMode, Side};
+use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Option chain order book for a single expiration.
 ///
@@ -375,6 +378,137 @@ impl OptionChainOrderBook {
         }
 
         Ok(ChainMassCancelResult { per_child })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this chain's strikes.
+    ///
+    /// # Description
+    ///
+    /// Searches all strikes for the specified order. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        for entry in self.strikes.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all strikes.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all strikes in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all strikes and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches all strikes for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        self.strikes
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all strikes.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.strikes
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
     }
 
     /// Returns the ATM strike closest to the given spot price.

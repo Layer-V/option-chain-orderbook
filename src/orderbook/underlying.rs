@@ -14,9 +14,12 @@ use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, STPMode, Side};
+use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Order book for a single underlying asset.
 ///
@@ -452,6 +455,137 @@ impl UnderlyingOrderBook {
         Ok(UnderlyingMassCancelResult { per_child })
     }
 
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this underlying's expirations.
+    ///
+    /// # Description
+    ///
+    /// Searches all expirations for the specified order. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        for entry in self.expirations.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all expirations.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all expirations.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all expirations and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches all expirations for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        self.expirations
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all expirations.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.expirations
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
+    }
+
     /// Returns the total strike count across all expirations.
     #[must_use]
     pub fn total_strike_count(&self) -> usize {
@@ -827,6 +961,148 @@ impl UnderlyingOrderBookManager {
         }
 
         Ok(GlobalMassCancelResult { per_child })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Searches all underlyings for the specified order. Returns the option
+    /// symbol and current status if found. Complexity is O(U × E × S) in the
+    /// worst case.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order_across_underlyings(
+        &self,
+        order_id: OrderId,
+    ) -> Option<(String, OrderStatus)> {
+        for entry in self.underlyings.iter() {
+            if let Some(result) = entry.value().find_order(order_id) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from all underlyings.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders_across_underlyings(&self) -> usize {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().total_active_orders())
+            .sum()
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to all underlyings and returns the total purged.
+    /// Complexity is O(U × E × S) where U is the number of underlyings,
+    /// E expirations, and S strikes.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states_across_underlyings(&self, older_than: Duration) -> usize {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().purge_terminal_states(older_than))
+            .sum()
+    }
+
+    /// Returns all currently active orders for a specific user across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Searches all underlyings for resting orders belonging to the specified
+    /// user. Returns tuples of (symbol, order_id, status). Complexity is
+    /// O(U × E × S) where U is the number of underlyings, E expirations,
+    /// and S strikes.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user_across_underlyings(
+        &self,
+        user_id: Hash32,
+    ) -> Vec<(String, OrderId, OrderStatus)> {
+        self.underlyings
+            .iter()
+            .flat_map(|entry| entry.value().orders_by_user(user_id))
+            .collect()
+    }
+
+    /// Returns a summary of terminal order transitions across all underlyings.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from all underlyings.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary_across_underlyings(&self) -> TerminalOrderSummary {
+        self.underlyings
+            .iter()
+            .map(|entry| entry.value().terminal_order_summary())
+            .sum()
     }
 
     /// Returns the total expiration count across all underlyings.

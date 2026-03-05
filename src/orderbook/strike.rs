@@ -15,9 +15,12 @@ use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, STPMode, Side};
+use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Order book for a single strike price containing both call and put.
 ///
@@ -415,6 +418,139 @@ impl StrikeOrderBook {
                 (self.put.symbol().to_string(), put_result),
             ],
         })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this strike's call or put book.
+    ///
+    /// # Description
+    ///
+    /// Searches the call book first, then the put book. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        if let Some(status) = self.call.get_order_status(order_id) {
+            return Some((self.call.symbol().to_string(), status));
+        }
+        if let Some(status) = self.put.get_order_status(order_id) {
+            return Some((self.put.symbol().to_string(), status));
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from both the call and put option books.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.call
+            .active_order_count()
+            .saturating_add(self.put.active_order_count())
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to both call and put books and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.call
+            .purge_terminal_states(older_than)
+            .saturating_add(self.put.purge_terminal_states(older_than))
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches both call and put books for resting orders belonging to the
+    /// specified user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        let mut result = Vec::new();
+        let call_symbol = self.call.symbol().to_string();
+        for (id, status) in self.call.orders_by_user(user_id) {
+            result.push((call_symbol.clone(), id, status));
+        }
+        let put_symbol = self.put.symbol().to_string();
+        for (id, status) in self.put.orders_by_user(user_id) {
+            result.push((put_symbol.clone(), id, status));
+        }
+        result
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from both call and put books.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.call.terminal_order_summary() + self.put.terminal_order_summary()
     }
 
     /// Updates the Greeks for the call option.

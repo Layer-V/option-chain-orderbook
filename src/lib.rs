@@ -171,6 +171,7 @@
 //! | `05_underlying_orderbook` | Underlying level (all expirations) |
 //! | `06_full_hierarchy` | Complete hierarchy with trading scenarios |
 //! | `07_mass_cancel` | Hierarchical mass cancel operations |
+//! | `08_order_lifecycle` | Order state tracking and lifecycle queries |
 //!
 //! Run examples with:
 //! ```bash
