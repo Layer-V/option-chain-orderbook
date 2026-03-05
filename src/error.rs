@@ -160,6 +160,15 @@ pub enum Error {
     /// Error from expiration date operations.
     #[error("expiration date error: {0}")]
     ExpirationDateError(#[from] optionstratlib::model::ExpirationDateError),
+
+    /// Error when a symbol string is malformed.
+    #[error("invalid symbol '{symbol}': {reason}")]
+    InvalidSymbol {
+        /// The malformed symbol.
+        symbol: String,
+        /// Reason for the error.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -312,6 +321,15 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// Creates a new invalid symbol error.
+    #[must_use]
+    pub fn invalid_symbol(symbol: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidSymbol {
+            symbol: symbol.into(),
+            reason: reason.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -447,5 +465,16 @@ mod tests {
         assert!(msg.contains("BTC-20240329-50000-C"));
         assert!(msg.contains("Halted"));
         assert!(msg.contains("instrument not active"));
+    }
+
+    #[test]
+    fn test_invalid_symbol_error() {
+        let err = Error::invalid_symbol(
+            "BTC-bad-symbol",
+            "expected format UNDERLYING-YYYYMMDD-STRIKE-C|P",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("BTC-bad-symbol"));
+        assert!(msg.contains("expected format"));
     }
 }

@@ -220,3 +220,4 @@ pub mod orderbook;
 pub mod utils;
 
 pub use error::{Error, Result};
+pub use utils::{ParsedSymbol, SymbolParser};
