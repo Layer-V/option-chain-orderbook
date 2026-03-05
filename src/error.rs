@@ -160,6 +160,15 @@ pub enum Error {
     /// Error from expiration date operations.
     #[error("expiration date error: {0}")]
     ExpirationDateError(#[from] optionstratlib::model::ExpirationDateError),
+
+    /// Error when a symbol string is malformed.
+    #[error("invalid symbol '{symbol}': {reason}")]
+    InvalidSymbol {
+        /// The malformed symbol.
+        symbol: String,
+        /// Reason for the error.
+        reason: String,
+    },
 }
 
 impl Error {
@@ -310,6 +319,15 @@ impl Error {
     pub fn decimal(message: impl Into<String>) -> Self {
         Self::DecimalError {
             message: message.into(),
+        }
+    }
+
+    /// Creates a new invalid symbol error.
+    #[must_use]
+    pub fn invalid_symbol(symbol: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidSymbol {
+            symbol: symbol.into(),
+            reason: reason.into(),
         }
     }
 }
