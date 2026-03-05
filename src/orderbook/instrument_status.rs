@@ -179,8 +179,14 @@ mod tests {
             InstrumentStatus::Settling,
             InstrumentStatus::Expired,
         ] {
-            let json = serde_json::to_string(&status).expect("serialize");
-            let deserialized: InstrumentStatus = serde_json::from_str(&json).expect("deserialize");
+            let json = match serde_json::to_string(&status) {
+                Ok(j) => j,
+                Err(err) => panic!("serialization failed: {}", err),
+            };
+            let deserialized: InstrumentStatus = match serde_json::from_str(&json) {
+                Ok(d) => d,
+                Err(err) => panic!("deserialization failed: {}", err),
+            };
             assert_eq!(status, deserialized);
         }
     }

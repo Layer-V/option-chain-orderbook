@@ -236,7 +236,11 @@ mod tests {
         let quote = Quote::new(Some(100), 10, Some(105), 5, 0);
 
         assert_eq!(quote.spread(), Some(5));
-        assert!((quote.mid_price().unwrap() - 102.5).abs() < 0.01);
+        let mid = match quote.mid_price() {
+            Some(m) => m,
+            None => panic!("expected mid price"),
+        };
+        assert!((mid - 102.5).abs() < 0.01);
     }
 
     #[test]
@@ -277,7 +281,11 @@ mod tests {
         let spread_bps = quote.spread_bps();
         assert!(spread_bps.is_some());
         // Spread = 5, mid = 102.5, bps = 5/102.5 * 10000 ≈ 487.8
-        assert!((spread_bps.unwrap() - 487.8).abs() < 1.0);
+        let bps = match spread_bps {
+            Some(b) => b,
+            None => panic!("expected spread bps"),
+        };
+        assert!((bps - 487.8).abs() < 1.0);
     }
 
     #[test]

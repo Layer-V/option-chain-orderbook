@@ -3,7 +3,7 @@
 //! This module provides the [`ExpirationOrderBook`] and [`ExpirationOrderBookManager`]
 //! for managing all expirations for a single underlying asset.
 
-use super::chain::OptionChainOrderBook;
+use super::chain::{ChainMassCancelResult, OptionChainOrderBook};
 use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
@@ -13,7 +13,8 @@ use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, OrderId, STPMode, Side};
+use pricelevel::Hash32;
 use std::sync::Arc;
 
 /// Order book for a single expiration date.
@@ -189,6 +190,136 @@ impl ExpirationOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.chain.fee_schedule()
+    }
+
+    /// Cancels all resting orders across the expiration's option chain.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order across the chain for this expiration and
+    /// returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// An [`ExpirationMassCancelResult`] containing per-chain results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let book = ExpirationOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = match book.cancel_all() {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_all(&self) -> Result<ExpirationMassCancelResult> {
+        let result = self.chain.cancel_all()?;
+
+        Ok(ExpirationMassCancelResult {
+            per_child: vec![(self.expiration.to_string(), result)],
+        })
+    }
+
+    /// Cancels all resting orders on a specific side across the expiration's chain.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order on the provided side across the chain for
+    /// this expiration and returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `side` - Side to cancel ([`Side::Buy`] or [`Side::Sell`]).
+    ///
+    /// # Returns
+    ///
+    /// An [`ExpirationMassCancelResult`] containing per-chain results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use orderbook_rs::Side;
+    ///
+    /// let book = ExpirationOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = match book.cancel_by_side(Side::Buy) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_side(&self, side: Side) -> Result<ExpirationMassCancelResult> {
+        let result = self.chain.cancel_by_side(side)?;
+
+        Ok(ExpirationMassCancelResult {
+            per_child: vec![(self.expiration.to_string(), result)],
+        })
+    }
+
+    /// Cancels all resting orders for a specific user across the expiration's chain.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order attributed to the provided user identifier
+    /// across the chain for this expiration and returns the aggregated
+    /// cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - User identifier to cancel (32-byte hash).
+    ///
+    /// # Returns
+    ///
+    /// An [`ExpirationMassCancelResult`] containing per-chain results plus
+    /// aggregated counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use pricelevel::Hash32;
+    ///
+    /// let book = ExpirationOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let user = Hash32::from([1u8; 32]);
+    /// let result = match book.cancel_by_user(user) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_user(&self, user_id: Hash32) -> Result<ExpirationMassCancelResult> {
+        let result = self.chain.cancel_by_user(user_id)?;
+
+        Ok(ExpirationMassCancelResult {
+            per_child: vec![(self.expiration.to_string(), result)],
+        })
     }
 
     /// Gets or creates a strike order book, returning an Arc reference.
@@ -508,14 +639,217 @@ impl std::fmt::Display for ExpirationManagerStats {
     }
 }
 
+/// Expiration-level mass cancel summary.
+///
+/// # Description
+///
+/// Aggregates per-chain mass cancel results for a single expiration.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Use [`books_affected`](Self::books_affected) and [`total_cancelled`](Self::total_cancelled)
+/// for aggregated counts.
+///
+/// # Errors
+///
+/// None.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::ExpirationMassCancelResult;
+///
+/// let result = ExpirationMassCancelResult { per_child: Vec::new() };
+/// assert_eq!(result.total_cancelled(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ExpirationMassCancelResult {
+    /// Per-chain cancellation results keyed by expiration.
+    pub per_child: Vec<(String, ChainMassCancelResult)>,
+}
+
+impl ExpirationMassCancelResult {
+    /// Returns the number of chain books with cancelled orders.
+    ///
+    /// # Description
+    ///
+    /// Counts how many chain books recorded at least one cancelled order.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of chain books affected (books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationMassCancelResult;
+    ///
+    /// let result = ExpirationMassCancelResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .filter(|(_, result)| result.total_cancelled() > 0)
+            .count()
+    }
+
+    /// Returns the total number of cancelled orders across the expiration.
+    ///
+    /// # Description
+    ///
+    /// Sums cancelled orders across the chain for this expiration.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total cancelled orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ExpirationMassCancelResult;
+    ///
+    /// let result = ExpirationMassCancelResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_cancelled(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_cancelled())
+            .sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use optionstratlib::prelude::pos_or_panic;
     use orderbook_rs::{OrderId, Side};
+    use pricelevel::Hash32;
 
     fn test_expiration() -> ExpirationDate {
         ExpirationDate::Days(pos_or_panic!(30.0))
+    }
+
+    #[test]
+    fn test_expiration_cancel_all() {
+        let exp = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let s1 = exp.get_or_create_strike(50000);
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = s1.put().add_limit_order(OrderId::new(), Side::Sell, 60, 5) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        let s2 = exp.get_or_create_strike(52000);
+        if let Err(err) = s2.call().add_limit_order(OrderId::new(), Side::Buy, 80, 10) {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+
+        assert_eq!(exp.total_order_count(), 3);
+
+        let result = match exp.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 3);
+        assert_eq!(exp.total_order_count(), 0);
+    }
+
+    #[test]
+    fn test_expiration_cancel_by_side() {
+        let exp = ExpirationOrderBook::new("BTC", test_expiration());
+
+        let s1 = exp.get_or_create_strike(50000);
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = s1
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        assert_eq!(exp.total_order_count(), 2);
+
+        let result = match exp.cancel_by_side(Side::Sell) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 1);
+        assert_eq!(exp.total_order_count(), 1);
+    }
+
+    #[test]
+    fn test_expiration_cancel_by_user() {
+        let exp = ExpirationOrderBook::new("BTC", test_expiration());
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        let s1 = exp.get_or_create_strike(50000);
+        if let Err(err) =
+            s1.call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s1);
+
+        let s2 = exp.get_or_create_strike(52000);
+        if let Err(err) =
+            s2.put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+        drop(s2);
+
+        assert_eq!(exp.total_order_count(), 2);
+
+        let result = match exp.cancel_by_user(user_a) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 1);
+        assert_eq!(exp.total_order_count(), 1);
     }
 
     #[test]
@@ -543,10 +877,12 @@ mod tests {
         let exp = ExpirationOrderBook::new("BTC", test_expiration());
 
         let strike = exp.get_or_create_strike(50000);
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(exp.total_order_count(), 1);
     }
@@ -602,8 +938,16 @@ mod tests {
         drop(book.get_or_create_strike(50000));
         drop(book.get_or_create_strike(55000));
 
-        assert_eq!(book.atm_strike(48000).unwrap(), 50000);
-        assert_eq!(book.atm_strike(53000).unwrap(), 55000);
+        let atm1 = match book.atm_strike(48000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm1, 50000);
+        let atm2 = match book.atm_strike(53000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm2, 55000);
     }
 
     #[test]
@@ -657,10 +1001,12 @@ mod tests {
 
         let exp_book = manager.get_or_create(test_expiration());
         let strike = exp_book.get_or_create_strike(50000);
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
         drop(strike);
         drop(exp_book);
 
@@ -685,10 +1031,12 @@ mod tests {
 
         let exp_book = manager.get_or_create(test_expiration());
         let strike = exp_book.get_or_create_strike(50000);
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
         drop(strike);
         drop(exp_book);
 

@@ -275,7 +275,10 @@ mod tests {
         let retrieved = registry.get(id);
         assert!(retrieved.is_some());
 
-        let retrieved = retrieved.unwrap();
+        let retrieved = match retrieved {
+            Some(r) => r,
+            None => panic!("expected instrument info"),
+        };
         assert_eq!(retrieved.symbol(), "BTC-20240329-50000-C");
         assert_eq!(retrieved.strike(), 50000);
         assert_eq!(retrieved.option_style(), OptionStyle::Call);
@@ -331,11 +334,19 @@ mod tests {
         // Verify first and last
         let first = registry.get(1);
         assert!(first.is_some());
-        assert_eq!(first.unwrap().strike(), 50000);
+        let first = match first {
+            Some(f) => f,
+            None => panic!("expected instrument info"),
+        };
+        assert_eq!(first.strike(), 50000);
 
         let last = registry.get(10);
         assert!(last.is_some());
-        assert_eq!(last.unwrap().strike(), 59000);
+        let last = match last {
+            Some(l) => l,
+            None => panic!("expected instrument info"),
+        };
+        assert_eq!(last.strike(), 59000);
     }
 
     #[test]
@@ -359,7 +370,10 @@ mod tests {
 
         let mut all_ids: Vec<u32> = handles
             .into_iter()
-            .flat_map(|h| h.join().unwrap())
+            .flat_map(|h| match h.join() {
+                Ok(ids) => ids,
+                Err(_) => panic!("thread panicked"),
+            })
             .collect();
 
         all_ids.sort();

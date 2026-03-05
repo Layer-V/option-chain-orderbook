@@ -90,7 +90,10 @@ mod tests {
         shared.set(Some(schedule));
         let result = shared.get();
         assert!(result.is_some());
-        let s = result.unwrap();
+        let s = match result {
+            Some(s) => s,
+            None => panic!("expected fee schedule"),
+        };
         assert_eq!(s.maker_fee_bps, -2);
         assert_eq!(s.taker_fee_bps, 5);
     }
@@ -100,7 +103,10 @@ mod tests {
         let shared = SharedFeeSchedule::new();
         shared.set(Some(FeeSchedule::new(-2, 5)));
         shared.set(Some(FeeSchedule::new(-5, 10)));
-        let s = shared.get().unwrap();
+        let s = match shared.get() {
+            Some(s) => s,
+            None => panic!("expected fee schedule"),
+        };
         assert_eq!(s.maker_fee_bps, -5);
         assert_eq!(s.taker_fee_bps, 10);
     }
@@ -117,7 +123,10 @@ mod tests {
     fn test_shared_fee_schedule_zero_fee() {
         let shared = SharedFeeSchedule::new();
         shared.set(Some(FeeSchedule::zero_fee()));
-        let s = shared.get().unwrap();
+        let s = match shared.get() {
+            Some(s) => s,
+            None => panic!("expected fee schedule"),
+        };
         assert!(s.is_zero_fee());
     }
 

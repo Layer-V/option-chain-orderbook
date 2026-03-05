@@ -442,10 +442,7 @@ mod tests {
 
     #[test]
     fn test_instrument_not_active_error() {
-        let err = Error::instrument_not_active(
-            "BTC-20240329-50000-C",
-            InstrumentStatus::Halted,
-        );
+        let err = Error::instrument_not_active("BTC-20240329-50000-C", InstrumentStatus::Halted);
         let msg = err.to_string();
         assert!(msg.contains("BTC-20240329-50000-C"));
         assert!(msg.contains("Halted"));
