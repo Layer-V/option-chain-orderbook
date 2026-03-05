@@ -7,12 +7,13 @@ use super::contract_specs::{ContractSpecs, SharedContractSpecs};
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
-use super::strike::{StrikeOrderBook, StrikeOrderBookManager};
+use super::strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::{FeeSchedule, OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, OrderId, STPMode, Side};
+use pricelevel::Hash32;
 use std::sync::Arc;
 
 /// Option chain order book for a single expiration.
@@ -235,6 +236,147 @@ impl OptionChainOrderBook {
         self.strikes.total_order_count()
     }
 
+    /// Cancels all resting orders across every strike in the chain.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order across all strikes and returns the aggregated
+    /// cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`ChainMassCancelResult`] containing per-strike results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any underlying cancellation errors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionChainOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = match chain.cancel_all() {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_all(&self) -> Result<ChainMassCancelResult> {
+        let mut per_child = Vec::new();
+
+        for entry in self.strikes.iter() {
+            let strike_key = entry.key().to_string();
+            let result = entry.value().cancel_all()?;
+            per_child.push((strike_key, result));
+        }
+
+        Ok(ChainMassCancelResult { per_child })
+    }
+
+    /// Cancels all resting orders on a specific side across every strike.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order on the provided side across all strikes and
+    /// returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `side` - Side to cancel ([`Side::Buy`] or [`Side::Sell`]).
+    ///
+    /// # Returns
+    ///
+    /// A [`ChainMassCancelResult`] containing per-strike results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any underlying cancellation errors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionChainOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use orderbook_rs::Side;
+    ///
+    /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let result = match chain.cancel_by_side(Side::Buy) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_side(&self, side: Side) -> Result<ChainMassCancelResult> {
+        let mut per_child = Vec::new();
+
+        for entry in self.strikes.iter() {
+            let strike_key = entry.key().to_string();
+            let result = entry.value().cancel_by_side(side)?;
+            per_child.push((strike_key, result));
+        }
+
+        Ok(ChainMassCancelResult { per_child })
+    }
+
+    /// Cancels all resting orders for a specific user across every strike.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order attributed to the provided user identifier
+    /// across all strikes and returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - User identifier to cancel (32-byte hash).
+    ///
+    /// # Returns
+    ///
+    /// A [`ChainMassCancelResult`] containing per-strike results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any underlying cancellation errors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionChainOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use pricelevel::Hash32;
+    ///
+    /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)));
+    /// let user = Hash32::from([1u8; 32]);
+    /// let result = match chain.cancel_by_user(user) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_user(&self, user_id: Hash32) -> Result<ChainMassCancelResult> {
+        let mut per_child = Vec::new();
+
+        for entry in self.strikes.iter() {
+            let strike_key = entry.key().to_string();
+            let result = entry.value().cancel_by_user(user_id)?;
+            per_child.push((strike_key, result));
+        }
+
+        Ok(ChainMassCancelResult { per_child })
+    }
+
     /// Returns the ATM strike closest to the given spot price.
     ///
     /// # Errors
@@ -273,6 +415,110 @@ impl std::fmt::Display for OptionChainStats {
             "{}: {} strikes, {} orders",
             self.expiration, self.strike_count, self.total_orders
         )
+    }
+}
+
+/// Chain-level mass cancel summary.
+///
+/// # Description
+///
+/// Aggregates per-strike mass cancel results for an option chain.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Use [`books_affected`](Self::books_affected) and [`total_cancelled`](Self::total_cancelled)
+/// for aggregated counts.
+///
+/// # Errors
+///
+/// None.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::ChainMassCancelResult;
+///
+/// let result = ChainMassCancelResult { per_child: Vec::new() };
+/// assert_eq!(result.total_cancelled(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct ChainMassCancelResult {
+    /// Per-strike cancellation results keyed by strike price.
+    pub per_child: Vec<(String, StrikeMassCancelResult)>,
+}
+
+impl ChainMassCancelResult {
+    /// Returns the number of strike books with cancelled orders.
+    ///
+    /// # Description
+    ///
+    /// Counts how many strike books recorded at least one cancelled order.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of strike books affected (books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ChainMassCancelResult;
+    ///
+    /// let result = ChainMassCancelResult { per_child: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_child
+            .iter()
+            .filter(|(_, result)| result.total_cancelled() > 0)
+            .count()
+    }
+
+    /// Returns the total number of cancelled orders across the chain.
+    ///
+    /// # Description
+    ///
+    /// Sums cancelled orders across every strike in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total cancelled orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::ChainMassCancelResult;
+    ///
+    /// let result = ChainMassCancelResult { per_child: Vec::new() };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_cancelled(&self) -> usize {
+        self.per_child
+            .iter()
+            .map(|(_, result)| result.total_cancelled())
+            .sum()
     }
 }
 
@@ -540,14 +786,18 @@ mod tests {
 
         {
             let strike = chain.get_or_create_strike(50000);
-            strike
+            if let Err(err) = strike
                 .call()
                 .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-                .unwrap();
-            strike
+            {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) = strike
                 .put()
                 .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
-                .unwrap();
+            {
+                panic!("add order failed: {}", err);
+            }
         }
 
         assert_eq!(chain.total_order_count(), 2);
@@ -559,22 +809,30 @@ mod tests {
 
         {
             let strike = chain.get_or_create_strike(50000);
-            strike
+            if let Err(err) = strike
                 .call()
                 .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-                .unwrap();
-            strike
+            {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) = strike
                 .call()
                 .add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-                .unwrap();
-            strike
+            {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) = strike
                 .put()
                 .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
-                .unwrap();
-            strike
+            {
+                panic!("add order failed: {}", err);
+            }
+            if let Err(err) = strike
                 .put()
                 .add_limit_order(OrderId::new(), Side::Sell, 51, 5)
-                .unwrap();
+            {
+                panic!("add order failed: {}", err);
+            }
         }
 
         let stats = chain.stats();
@@ -625,8 +883,16 @@ mod tests {
         drop(chain.get_or_create_strike(50000));
         drop(chain.get_or_create_strike(55000));
 
-        assert_eq!(chain.atm_strike(48000).unwrap(), 50000);
-        assert_eq!(chain.atm_strike(53000).unwrap(), 55000);
+        let atm1 = match chain.atm_strike(48000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm1, 50000);
+        let atm2 = match chain.atm_strike(53000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm2, 55000);
     }
 
     #[test]
@@ -705,10 +971,12 @@ mod tests {
 
         let chain = manager.get_or_create(test_expiration());
         let strike = chain.get_or_create_strike(50000);
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
         drop(strike);
         drop(chain);
 

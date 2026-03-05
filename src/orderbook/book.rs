@@ -9,8 +9,8 @@ use super::validation::ValidationConfig;
 use crate::Result;
 use optionstratlib::OptionStyle;
 use orderbook_rs::{
-    DefaultOrderBook, FeeSchedule, OrderBookSnapshot, OrderId, STPMode, Side, TimeInForce,
-    TradeResult,
+    DefaultOrderBook, FeeSchedule, MassCancelResult, OrderBookSnapshot, OrderId, STPMode, Side,
+    TimeInForce, TradeResult,
 };
 use pricelevel::{Hash32, MatchResult};
 use std::collections::hash_map::DefaultHasher;
@@ -704,6 +704,131 @@ impl OptionOrderBook {
         }
     }
 
+    /// Cancels all resting orders in this option book.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order in the underlying OrderBook and returns the
+    /// aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`MassCancelResult`] containing the cancelled order count (orders) and
+    /// identifiers.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
+    ///     panic!("add order failed: {}", err);
+    /// }
+    /// let result = match book.cancel_all() {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.cancelled_count(), 1);
+    /// ```
+    pub fn cancel_all(&self) -> Result<MassCancelResult> {
+        Ok(self.book.cancel_all_orders())
+    }
+
+    /// Cancels all resting orders on a specific side.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order on the provided side and returns the
+    /// aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `side` - Side to cancel ([`Side::Buy`] or [`Side::Sell`]).
+    ///
+    /// # Returns
+    ///
+    /// A [`MassCancelResult`] containing the cancelled order count (orders) and
+    /// identifiers.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 1) {
+    ///     panic!("add order failed: {}", err);
+    /// }
+    /// let result = match book.cancel_by_side(Side::Buy) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.cancelled_count(), 1);
+    /// ```
+    pub fn cancel_by_side(&self, side: Side) -> Result<MassCancelResult> {
+        Ok(self.book.cancel_orders_by_side(side))
+    }
+
+    /// Cancels all resting orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order attributed to the provided user identifier
+    /// and returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - User identifier to cancel (32-byte hash).
+    ///
+    /// # Returns
+    ///
+    /// A [`MassCancelResult`] containing the cancelled order count (orders) and
+    /// identifiers.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::OptionOrderBook;
+    /// use optionstratlib::OptionStyle;
+    /// use orderbook_rs::{OrderId, Side};
+    /// use pricelevel::Hash32;
+    ///
+    /// let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+    /// let user = Hash32::from([1u8; 32]);
+    /// if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 1, user) {
+    ///     panic!("add order failed: {}", err);
+    /// }
+    /// let result = match book.cancel_by_user(user) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.cancelled_count(), 1);
+    /// ```
+    pub fn cancel_by_user(&self, user_id: Hash32) -> Result<MassCancelResult> {
+        Ok(self.book.cancel_orders_by_user(user_id))
+    }
+
     /// Returns the current best quote.
     #[must_use]
     pub fn best_quote(&self) -> Quote {
@@ -900,10 +1025,12 @@ mod tests {
     fn test_add_limit_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.order_count(), 2);
         assert_eq!(book.bid_level_count(), 1);
@@ -914,10 +1041,12 @@ mod tests {
     fn test_best_quote() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         let quote = book.best_quote();
 
@@ -932,13 +1061,15 @@ mod tests {
     fn test_mid_price_and_spread() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 102, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
 
-        assert_eq!(book.mid_price(), Some(101.0));
-        assert_eq!(book.spread(), Some(2));
+        assert_eq!(book.mid_price(), Some(100.5));
+        assert_eq!(book.spread(), Some(1));
     }
 
     #[test]
@@ -946,24 +1077,99 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
         let order_id = OrderId::new();
-        book.add_limit_order(order_id, Side::Buy, 100, 10).unwrap();
+        if let Err(err) = book.add_limit_order(order_id, Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 1);
 
-        let cancelled = book.cancel_order(order_id).unwrap();
+        let cancelled = match book.cancel_order(order_id) {
+            Ok(c) => c,
+            Err(err) => panic!("cancel order failed: {}", err),
+        };
         assert!(cancelled);
         assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_all_orders() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
+
+        let result = match book.cancel_all() {
+            Ok(result) => result,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.cancelled_count(), 2);
+        assert_eq!(book.order_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_by_side() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
+
+        let result = match book.cancel_by_side(Side::Buy) {
+            Ok(result) => result,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.cancelled_count(), 1);
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_bid().is_none());
+        assert!(book.best_ask().is_some());
+    }
+
+    #[test]
+    fn test_cancel_by_user() {
+        let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 101, 5, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        let result = match book.cancel_by_user(user_a) {
+            Ok(result) => result,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.cancelled_count(), 1);
+        assert_eq!(book.order_count(), 1);
+        assert!(book.best_ask().is_some());
     }
 
     #[test]
     fn test_total_depth() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Buy, 99, 20)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 99, 20) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.total_bid_depth(), 30);
         assert_eq!(book.total_ask_depth(), 5);
@@ -983,10 +1189,12 @@ mod tests {
     fn test_imbalance() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 60)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 101, 40)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 60) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 40) {
+            panic!("add order failed: {}", err);
+        }
 
         // Imbalance = (60 - 40) / (60 + 40) = 0.2
         let imbalance = book.imbalance(5);
@@ -1011,8 +1219,11 @@ mod tests {
     fn test_add_limit_order_with_tif() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
-            .unwrap();
+        if let Err(err) =
+            book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.order_count(), 1);
     }
@@ -1024,10 +1235,12 @@ mod tests {
         assert!(book.best_bid().is_none());
         assert!(book.best_ask().is_none());
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.best_bid(), Some(100));
         assert_eq!(book.best_ask(), Some(105));
@@ -1037,10 +1250,12 @@ mod tests {
     fn test_spread_bps() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 102, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 102, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         let spread_bps = book.spread_bps();
         assert!(spread_bps.is_some());
@@ -1050,10 +1265,12 @@ mod tests {
     fn test_snapshot() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         let snapshot = book.snapshot(5);
         assert_eq!(snapshot.bids.len(), 1);
@@ -1064,10 +1281,12 @@ mod tests {
     fn test_clear() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.order_count(), 2);
         book.clear();
@@ -1078,8 +1297,9 @@ mod tests {
     fn test_update_last_quote() {
         let mut book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
 
         let changed = book.update_last_quote();
         assert!(changed);
@@ -1094,10 +1314,12 @@ mod tests {
     fn test_depth_at_price() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 5)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 5) {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(book.bid_depth_at_price(100), 10);
         assert_eq!(book.bid_depth_at_price(99), 0);
@@ -1109,12 +1331,15 @@ mod tests {
     fn test_vwap() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Buy, 99, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 99, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 10) {
+            panic!("add order failed: {}", err);
+        }
 
         let vwap_sell = book.vwap(5, Side::Sell);
         assert!(vwap_sell.is_some());
@@ -1127,10 +1352,12 @@ mod tests {
     fn test_micro_price() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 102, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 102, 10) {
+            panic!("add order failed: {}", err);
+        }
 
         let micro = book.micro_price();
         assert!(micro.is_some());
@@ -1140,10 +1367,12 @@ mod tests {
     fn test_market_impact() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        book.add_limit_order(OrderId::new(), Side::Sell, 105, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 105, 10) {
+            panic!("add order failed: {}", err);
+        }
 
         let impact = book.market_impact(5, Side::Buy);
         // avg_price is f64, just verify it's a valid number
@@ -1333,8 +1562,12 @@ mod tests {
 
         let id1 = OrderId::new();
         let id2 = OrderId::new();
-        book.add_limit_order(id1, Side::Buy, 100, 10).unwrap();
-        book.add_limit_order(id2, Side::Sell, 105, 5).unwrap();
+        if let Err(err) = book.add_limit_order(id1, Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = book.add_limit_order(id2, Side::Sell, 105, 5) {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 2);
 
         let cancelled = book.expire();
@@ -1360,7 +1593,10 @@ mod tests {
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = match result {
+            Ok(_) => panic!("expected error but got Ok"),
+            Err(e) => e,
+        };
         assert!(err.to_string().contains("instrument not active"));
         assert!(err.to_string().contains("Halted"));
     }
@@ -1372,7 +1608,11 @@ mod tests {
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Pending"));
+        let err = match result {
+            Ok(_) => panic!("expected error but got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Pending"));
     }
 
     #[test]
@@ -1382,7 +1622,11 @@ mod tests {
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Settling"));
+        let err = match result {
+            Ok(_) => panic!("expected error but got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Settling"));
     }
 
     #[test]
@@ -1392,7 +1636,11 @@ mod tests {
 
         let result = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Expired"));
+        let err = match result {
+            Ok(_) => panic!("expected error but got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Expired"));
     }
 
     #[test]
@@ -1403,7 +1651,11 @@ mod tests {
         let result =
             book.add_limit_order_with_tif(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Halted"));
+        let err = match result {
+            Ok(_) => panic!("expected error but got Ok"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Halted"));
     }
 
     #[test]
@@ -1427,8 +1679,9 @@ mod tests {
     fn test_halt_preserves_existing_orders() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 1);
 
         book.halt();
@@ -1442,11 +1695,16 @@ mod tests {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
         let oid = OrderId::new();
-        book.add_limit_order(oid, Side::Buy, 100, 10).unwrap();
+        if let Err(err) = book.add_limit_order(oid, Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         book.halt();
 
         // Cancellation should still work on halted instruments
-        let cancelled = book.cancel_order(oid).unwrap();
+        let cancelled = match book.cancel_order(oid) {
+            Ok(c) => c,
+            Err(err) => panic!("cancel order failed: {}", err),
+        };
         assert!(cancelled);
         assert!(book.is_empty());
     }
@@ -1490,7 +1748,11 @@ mod tests {
         assert_eq!(book.instrument_id(), 99);
         let vc = book.validation_config();
         assert!(vc.is_some());
-        assert_eq!(vc.unwrap().tick_size(), Some(10));
+        let vc = match vc {
+            Some(v) => v,
+            None => panic!("expected validation config"),
+        };
+        assert_eq!(vc.tick_size(), Some(10));
     }
 
     #[test]
@@ -1600,8 +1862,10 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-            .unwrap();
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+        {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — STP triggers, returns error
@@ -1622,13 +1886,16 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-            .unwrap();
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+        {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — maker cancelled, taker rests
-        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user)
-            .unwrap();
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user) {
+            panic!("add order failed: {}", err);
+        }
         // Taker (buy) should now be resting, maker (sell) was cancelled
         assert_eq!(book.order_count(), 1);
         assert!(book.best_bid().is_some());
@@ -1644,8 +1911,10 @@ mod tests {
         let user = Hash32::from([1u8; 32]);
 
         // Place a resting sell order
-        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
-            .unwrap();
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user)
+        {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(book.order_count(), 1);
 
         // Same user places a crossing buy — STP triggers, returns error
@@ -1664,12 +1933,17 @@ mod tests {
         let user_b = Hash32::from([2u8; 32]);
 
         // User A sells
-        book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user_a)
-            .unwrap();
+        if let Err(err) =
+            book.add_limit_order_with_user(OrderId::new(), Side::Sell, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
 
         // User B buys — should trade normally
-        book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_b)
-            .unwrap();
+        if let Err(err) = book.add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
         // Both matched and removed
         assert_eq!(book.order_count(), 0);
     }
@@ -1704,7 +1978,10 @@ mod tests {
         );
         let fs = book.fee_schedule();
         assert!(fs.is_some());
-        let s = fs.unwrap();
+        let s = match fs {
+            Some(s) => s,
+            None => panic!("expected fee schedule"),
+        };
         assert_eq!(s.maker_fee_bps, -2);
         assert_eq!(s.taker_fee_bps, 5);
     }
@@ -1726,7 +2003,10 @@ mod tests {
         assert_eq!(book.instrument_id(), 42);
         assert_eq!(book.stp_mode(), STPMode::CancelTaker);
         assert!(book.validation_config().is_some());
-        let fs = book.fee_schedule().unwrap();
+        let fs = match book.fee_schedule() {
+            Some(s) => s,
+            None => panic!("expected fee schedule"),
+        };
         assert_eq!(fs.maker_fee_bps, -5);
         assert_eq!(fs.taker_fee_bps, 10);
     }
@@ -1742,9 +2022,10 @@ mod tests {
             },
         );
         // Single order, no match — returns empty TradeResult
-        let result = book
-            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
@@ -1762,13 +2043,15 @@ mod tests {
             },
         );
         // Place a resting sell order
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
 
         // Aggressive buy matches the sell — trade occurs, fees calculated
-        let result = book
-            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
 
         // Taker fee: notional * taker_bps / 10_000 = (100 * 10) * 5 / 10_000 = 0
         // For small notionals, fees may round to zero. Just verify the fields exist
@@ -1782,12 +2065,14 @@ mod tests {
     fn test_add_limit_order_full_zero_fees_by_default() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         // Place a resting sell
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         // Aggressive buy with _full — no fee schedule, so zero fees
-        let result = book
-            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
     }
@@ -1803,9 +2088,16 @@ mod tests {
                 ..BookConfig::default()
             },
         );
-        let result = book
-            .add_limit_order_with_tif_full(OrderId::new(), Side::Buy, 100, 10, TimeInForce::Gtc)
-            .unwrap();
+        let result = match book.add_limit_order_with_tif_full(
+            OrderId::new(),
+            Side::Buy,
+            100,
+            10,
+            TimeInForce::Gtc,
+        ) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         // No match, so zero fees
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
@@ -1822,9 +2114,11 @@ mod tests {
             },
         );
         let user = Hash32::from([1u8; 32]);
-        let result = book
-            .add_limit_order_with_user_full(OrderId::new(), Side::Buy, 100, 10, user)
-            .unwrap();
+        let result =
+            match book.add_limit_order_with_user_full(OrderId::new(), Side::Buy, 100, 10, user) {
+                Ok(r) => r,
+                Err(err) => panic!("add order failed: {}", err),
+            };
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
     }
@@ -1840,16 +2134,17 @@ mod tests {
             },
         );
         let user = Hash32::from([1u8; 32]);
-        let result = book
-            .add_limit_order_with_tif_and_user_full(
-                OrderId::new(),
-                Side::Sell,
-                200,
-                5,
-                TimeInForce::Gtc,
-                user,
-            )
-            .unwrap();
+        let result = match book.add_limit_order_with_tif_and_user_full(
+            OrderId::new(),
+            Side::Sell,
+            200,
+            5,
+            TimeInForce::Gtc,
+            user,
+        ) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         assert_eq!(result.total_taker_fees, 0);
         assert_eq!(book.order_count(), 1);
     }
@@ -1863,11 +2158,13 @@ mod tests {
     #[test]
     fn test_last_trade_result_populated_after_match() {
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         // Trigger a match
-        book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         // last_trade_result should now be populated
         let tr = book.last_trade_result();
         assert!(tr.is_some());
@@ -1886,11 +2183,13 @@ mod tests {
         // Verifies that existing code path without fee schedule still works
         let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
         assert!(book.fee_schedule().is_none());
-        book.add_limit_order(OrderId::new(), Side::Sell, 100, 10)
-            .unwrap();
-        let result = book
-            .add_limit_order_full(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
+        let result = match book.add_limit_order_full(OrderId::new(), Side::Buy, 100, 10) {
+            Ok(r) => r,
+            Err(err) => panic!("add order failed: {}", err),
+        };
         assert_eq!(result.total_maker_fees, 0);
         assert_eq!(result.total_taker_fees, 0);
     }

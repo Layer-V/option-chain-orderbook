@@ -4,16 +4,19 @@ use option_chain_orderbook::orderbook::{OptionOrderBook, UnderlyingOrderBookMana
 use optionstratlib::prelude::pos_or_panic;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use orderbook_rs::{OrderId, Side};
+use pricelevel::Hash32;
 
 #[test]
 fn test_option_order_book_integration() {
     let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
     // Add orders
-    book.add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-        .unwrap();
-    book.add_limit_order(OrderId::new(), Side::Sell, 101, 5)
-        .unwrap();
+    if let Err(err) = book.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+        panic!("add order failed: {}", err);
+    }
+    if let Err(err) = book.add_limit_order(OrderId::new(), Side::Sell, 101, 5) {
+        panic!("add order failed: {}", err);
+    }
 
     // Verify state
     assert_eq!(book.order_count(), 2);
@@ -35,11 +38,11 @@ fn test_underlying_manager_integration() {
         strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+            .unwrap_or_else(|err| panic!("add order failed: {}", err));
         strike
             .put()
             .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
-            .unwrap();
+            .unwrap_or_else(|err| panic!("add order failed: {}", err));
     }
 
     // Verify aggregation
@@ -48,4 +51,104 @@ fn test_underlying_manager_integration() {
     assert_eq!(stats.total_expirations, 1);
     assert_eq!(stats.total_strikes, 1);
     assert_eq!(stats.total_orders, 2);
+}
+
+#[test]
+fn test_cancel_all_across_underlyings() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+
+    {
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(exp_date);
+        let strike = exp.get_or_create_strike(50000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+    }
+
+    {
+        let eth = manager.get_or_create("ETH");
+        let exp = eth.get_or_create_expiration(exp_date);
+        let strike = exp.get_or_create_strike(3000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 50, 7)
+        {
+            panic!("add order failed: {}", err);
+        }
+    }
+
+    let result = match manager.cancel_all_across_underlyings() {
+        Ok(result) => result,
+        Err(err) => panic!("cancel failed: {}", err),
+    };
+
+    assert_eq!(result.total_cancelled(), 3);
+    assert_eq!(result.books_affected(), 2);
+    assert_eq!(manager.total_order_count(), 0);
+}
+
+#[test]
+fn test_cancel_by_user_across_underlyings() {
+    let manager = UnderlyingOrderBookManager::new();
+    let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
+    let user_a = Hash32::from([1u8; 32]);
+    let user_b = Hash32::from([2u8; 32]);
+
+    {
+        let btc = manager.get_or_create("BTC");
+        let exp = btc.get_or_create_expiration(exp_date);
+        let strike = exp.get_or_create_strike(50000);
+
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+    }
+
+    {
+        let eth = manager.get_or_create("ETH");
+        let exp = eth.get_or_create_expiration(exp_date);
+        let strike = exp.get_or_create_strike(3000);
+
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 90, 6, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+    }
+
+    let result = match manager.cancel_by_user_across_underlyings(user_a) {
+        Ok(result) => result,
+        Err(err) => panic!("cancel failed: {}", err),
+    };
+
+    assert_eq!(result.total_cancelled(), 2);
+    assert_eq!(result.books_affected(), 2);
+    assert_eq!(manager.total_order_count(), 1);
 }

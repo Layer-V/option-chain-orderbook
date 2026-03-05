@@ -62,18 +62,24 @@ mod validation;
 
 // Re-export all public types
 pub use book::OptionOrderBook;
-pub use chain::{OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats};
+pub use chain::{
+    ChainMassCancelResult, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
+};
 pub use contract_specs::{ContractSpecs, ContractSpecsBuilder, ExerciseStyle, SettlementType};
-pub use expiration::{ExpirationManagerStats, ExpirationOrderBook, ExpirationOrderBookManager};
+pub use expiration::{
+    ExpirationManagerStats, ExpirationMassCancelResult, ExpirationOrderBook,
+    ExpirationOrderBookManager,
+};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};
-pub use strike::{StrikeOrderBook, StrikeOrderBookManager};
+pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
 pub use underlying::{
-    GlobalStats, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
+    GlobalMassCancelResult, GlobalStats, UnderlyingMassCancelResult, UnderlyingOrderBook,
+    UnderlyingOrderBookManager, UnderlyingStats,
 };
 pub use validation::ValidationConfig;
 
 // Re-export upstream types used in the public API
-pub use orderbook_rs::{FeeSchedule, STPMode, TradeResult};
+pub use orderbook_rs::{FeeSchedule, MassCancelResult, STPMode, TradeResult};
 pub use pricelevel::Hash32;

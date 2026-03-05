@@ -95,8 +95,10 @@
 //!     let strike = exp.get_or_create_strike(50000);
 //!
 //!     // Add orders to call
-//!     strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10).unwrap();
-//!     strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5).unwrap();
+//!     strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+//!         .expect("add order should succeed");
+//!     strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+//!         .expect("add order should succeed");
 //!
 //!     // Get quote
 //!     let quote = strike.call().best_quote();
@@ -118,8 +120,10 @@
 //! let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 //!
 //! // Add limit orders
-//! book.add_limit_order(OrderId::new(), Side::Buy, 500, 10).unwrap();
-//! book.add_limit_order(OrderId::new(), Side::Sell, 520, 5).unwrap();
+//! book.add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+//!     .expect("add order should succeed");
+//! book.add_limit_order(OrderId::new(), Side::Sell, 520, 5)
+//!     .expect("add order should succeed");
 //!
 //! // Get the best quote
 //! let quote = book.best_quote();
@@ -150,8 +154,8 @@
 //!     exotic_params: None,
 //! };
 //!
-//! let delta_value = delta(&option).unwrap();
-//! let gamma_value = gamma(&option).unwrap();
+//! let delta_value = delta(&option).expect("delta calculation should succeed");
+//! let gamma_value = gamma(&option).expect("gamma calculation should succeed");
 //! ```
 //!
 //! ## Examples
