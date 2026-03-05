@@ -466,4 +466,15 @@ mod tests {
         assert!(msg.contains("Halted"));
         assert!(msg.contains("instrument not active"));
     }
+
+    #[test]
+    fn test_invalid_symbol_error() {
+        let err = Error::invalid_symbol(
+            "BTC-bad-symbol",
+            "expected format UNDERLYING-YYYYMMDD-STRIKE-C|P",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("BTC-bad-symbol"));
+        assert!(msg.contains("expected format"));
+    }
 }

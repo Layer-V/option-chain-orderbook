@@ -64,25 +64,13 @@ pub fn parse_yyyymmdd(date_str: &str, symbol: &str) -> Result<ExpirationDate> {
         ));
     }
 
-    let year: i32 = date_str[0..4]
-        .parse()
-        .map_err(|_| Error::invalid_symbol(symbol, format!("invalid year in '{}'", date_str)))?;
-    let month: u32 = date_str[4..6]
-        .parse()
-        .map_err(|_| Error::invalid_symbol(symbol, format!("invalid month in '{}'", date_str)))?;
-    let day: u32 = date_str[6..8]
-        .parse()
-        .map_err(|_| Error::invalid_symbol(symbol, format!("invalid day in '{}'", date_str)))?;
+    let naive_date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
+        .map_err(|_| Error::invalid_symbol(symbol, format!("invalid date '{}'", date_str)))?;
 
-    let naive_date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| Error::invalid_symbol(symbol, format!("invalid date '{}'", date_str)))?;
-
-    let datetime = Utc.from_utc_datetime(&naive_date.and_hms_opt(23, 59, 59).ok_or_else(|| {
-        Error::invalid_symbol(
-            symbol,
-            format!("failed to create datetime for '{}'", date_str),
-        )
-    })?);
+    let naive_datetime = naive_date
+        .and_hms_opt(23, 59, 59)
+        .expect("23:59:59 is always a valid time");
+    let datetime = Utc.from_utc_datetime(&naive_datetime);
 
     Ok(ExpirationDate::DateTime(datetime))
 }
@@ -190,6 +178,13 @@ impl SymbolParser {
                 ),
             )
         })?;
+
+        if strike == 0 {
+            return Err(Error::invalid_symbol(
+                symbol,
+                "strike price must be positive, got 0",
+            ));
+        }
 
         let option_style = match parts[3] {
             "C" => OptionStyle::Call,
@@ -386,5 +381,13 @@ mod tests {
     fn test_parse_yyyymmdd_invalid_month() {
         let result = parse_yyyymmdd("20261330", "test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_invalid_strike_zero() {
+        let result = SymbolParser::parse("BTC-20260130-0-C");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("strike price must be positive"));
     }
 }
