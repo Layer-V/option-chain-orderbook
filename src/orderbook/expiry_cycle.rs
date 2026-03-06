@@ -111,15 +111,23 @@ impl ExpiryCycleConfig {
     /// Returns `Error::ConfigurationError` if:
     /// - `cycles` is empty
     /// - Any `CycleRule.count` is zero
+    /// - Duplicate `cycle_type` values exist
     /// - `expiry_time_utc` or `settlement_time_utc` has an invalid hour or minute
     pub fn validate(&self) -> Result<()> {
         if self.cycles.is_empty() {
             return Err(Error::configuration("cycles must not be empty"));
         }
+        let mut seen = std::collections::HashSet::new();
         for rule in &self.cycles {
             if rule.count == 0 {
                 return Err(Error::configuration(format!(
                     "cycle count for {:?} must be at least 1",
+                    rule.cycle_type
+                )));
+            }
+            if !seen.insert(rule.cycle_type) {
+                return Err(Error::configuration(format!(
+                    "duplicate cycle_type {:?} in config",
                     rule.cycle_type
                 )));
             }
@@ -171,13 +179,12 @@ impl ExpiryCycleConfig {
     pub fn generate_dates(&self, from: DateTime<Utc>) -> Result<Vec<ExpirationDate>> {
         self.validate()?;
 
-        let base = from.date_naive();
         let (h, m) = self.expiry_time_utc;
 
         let mut dates: Vec<ExpirationDate> = Vec::new();
 
         for rule in &self.cycles {
-            let cycle_dates = generate_cycle_dates(base, rule, h, m)?;
+            let cycle_dates = generate_cycle_dates(from, rule, h, m)?;
             dates.extend(cycle_dates);
         }
 
@@ -192,47 +199,50 @@ impl ExpiryCycleConfig {
 
 // ─── Date generation helpers ─────────────────────────────────────────────────
 
-/// Generates `rule.count` expiration dates of `rule.cycle_type` after `base`.
+/// Generates `rule.count` expiration dates of `rule.cycle_type` after `from`.
 fn generate_cycle_dates(
-    base: NaiveDate,
+    from: DateTime<Utc>,
     rule: &CycleRule,
     hour: u32,
     minute: u32,
 ) -> Result<Vec<ExpirationDate>> {
     match rule.cycle_type {
-        ExpiryType::Daily => generate_daily(base, rule.count, hour, minute),
-        ExpiryType::Weekly => generate_weekly(base, rule.count, hour, minute),
-        ExpiryType::Monthly => generate_monthly(base, rule.count, hour, minute),
-        ExpiryType::Quarterly => generate_quarterly(base, rule.count, hour, minute),
+        ExpiryType::Daily => generate_daily(from, rule.count, hour, minute),
+        ExpiryType::Weekly => generate_weekly(from, rule.count, hour, minute),
+        ExpiryType::Monthly => generate_monthly(from, rule.count, hour, minute),
+        ExpiryType::Quarterly => generate_quarterly(from, rule.count, hour, minute),
     }
 }
 
-/// Generates `count` daily expiration dates starting the calendar day after `base`.
+/// Generates `count` daily expiration dates starting the calendar day after `from`.
 fn generate_daily(
-    base: NaiveDate,
+    from: DateTime<Utc>,
     count: usize,
     hour: u32,
     minute: u32,
 ) -> Result<Vec<ExpirationDate>> {
+    let base = from.date_naive();
     let mut dates = Vec::with_capacity(count);
-    for i in 1..=(count as i64) {
-        let date = base
-            .checked_add_signed(Duration::days(i))
-            .ok_or_else(|| Error::configuration("date overflow generating daily dates"))?;
-        dates.push(to_expiration(date, hour, minute)?);
+    for i in 1..=count {
+        let day = base
+            .checked_add_signed(Duration::days(i as i64))
+            .ok_or_else(|| Error::configuration("date overflow generating daily expiry"))?;
+        dates.push(to_expiration(day, hour, minute)?);
     }
     Ok(dates)
 }
 
-/// Generates `count` weekly expiration dates (next N Fridays after `base`).
+/// Generates `count` weekly expiration dates (next N Fridays after `from`).
+///
+/// If `from` is on a Friday before the expiry time, that Friday is included.
 fn generate_weekly(
-    base: NaiveDate,
+    from: DateTime<Utc>,
     count: usize,
     hour: u32,
     minute: u32,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
-    let mut friday = next_friday_after(base)?;
+    let mut friday = next_friday_on_or_after(from, hour, minute)?;
     for _ in 0..count {
         dates.push(to_expiration(friday, hour, minute)?);
         friday = friday
@@ -243,20 +253,22 @@ fn generate_weekly(
 }
 
 /// Generates `count` monthly expiration dates (last Friday of each of the next
-/// `count` months whose last-Friday is strictly after `base`).
+/// `count` months whose expiration datetime is after `from`).
 fn generate_monthly(
-    base: NaiveDate,
+    from: DateTime<Utc>,
     count: usize,
     hour: u32,
     minute: u32,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
+    let base = from.date_naive();
     let mut year = base.year();
     let mut month = base.month();
 
     while dates.len() < count {
         let last_fri = last_friday_of_month(year, month)?;
-        if last_fri > base {
+        let candidate_dt = to_datetime(last_fri, hour, minute)?;
+        if candidate_dt > from {
             dates.push(to_expiration(last_fri, hour, minute)?);
         }
         (year, month) = advance_month(year, month)?;
@@ -265,20 +277,22 @@ fn generate_monthly(
 }
 
 /// Generates `count` quarterly expiration dates (last Friday of the next
-/// `count` quarter-end months Mar/Jun/Sep/Dec whose last-Friday is after `base`).
+/// `count` quarter-end months Mar/Jun/Sep/Dec whose expiration datetime is after `from`).
 fn generate_quarterly(
-    base: NaiveDate,
+    from: DateTime<Utc>,
     count: usize,
     hour: u32,
     minute: u32,
 ) -> Result<Vec<ExpirationDate>> {
     let mut dates = Vec::with_capacity(count);
+    let base = from.date_naive();
     let mut year = base.year();
     let mut q_month = quarter_end_month(base.month());
 
     while dates.len() < count {
         let last_fri = last_friday_of_month(year, q_month)?;
-        if last_fri > base {
+        let candidate_dt = to_datetime(last_fri, hour, minute)?;
+        if candidate_dt > from {
             dates.push(to_expiration(last_fri, hour, minute)?);
         }
         (year, q_month) = advance_quarter(year, q_month)?;
@@ -291,11 +305,35 @@ fn generate_quarterly(
 /// Returns the next Friday strictly after `date`.
 ///
 /// If `date` is itself a Friday, returns the Friday 7 days later.
+#[allow(dead_code)]
 fn next_friday_after(date: NaiveDate) -> Result<NaiveDate> {
     // num_days_from_monday(): Mon=0 Tue=1 Wed=2 Thu=3 Fri=4 Sat=5 Sun=6
     let weekday_num = date.weekday().num_days_from_monday() as i64;
     // Days until the *next* Friday (strictly after today):
     // If today is Fri (4), result would be 0 → use 7 instead.
+    let days = (4 - weekday_num + 7) % 7;
+    let days = if days == 0 { 7 } else { days };
+    date.checked_add_signed(Duration::days(days))
+        .ok_or_else(|| Error::configuration("date overflow finding next Friday"))
+}
+
+/// Returns the next Friday on or after `from`, considering expiry time.
+///
+/// If `from` is on a Friday and before the expiry time, returns that Friday.
+/// Otherwise, returns the next Friday.
+fn next_friday_on_or_after(from: DateTime<Utc>, hour: u32, minute: u32) -> Result<NaiveDate> {
+    let date = from.date_naive();
+    let weekday_num = date.weekday().num_days_from_monday() as i64;
+
+    // If today is Friday (4), check if we're before expiry time
+    if weekday_num == 4 {
+        let expiry_dt = to_datetime(date, hour, minute)?;
+        if from < expiry_dt {
+            return Ok(date);
+        }
+    }
+
+    // Days until the *next* Friday (strictly after today):
     let days = (4 - weekday_num + 7) % 7;
     let days = if days == 0 { 7 } else { days };
     date.checked_add_signed(Duration::days(days))
@@ -375,12 +413,17 @@ fn advance_quarter(year: i32, q_month: u32) -> Result<(i32, u32)> {
     }
 }
 
-/// Converts a `NaiveDate` and time components to an `ExpirationDate::DateTime`.
-fn to_expiration(date: NaiveDate, hour: u32, minute: u32) -> Result<ExpirationDate> {
+/// Converts a `NaiveDate` and time components to a `DateTime<Utc>`.
+fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
     let naive_dt = date
         .and_hms_opt(hour, minute, 0)
-        .ok_or_else(|| Error::configuration("invalid expiry time in to_expiration"))?;
-    let dt = Utc.from_utc_datetime(&naive_dt);
+        .ok_or_else(|| Error::configuration("invalid time in to_datetime"))?;
+    Ok(Utc.from_utc_datetime(&naive_dt))
+}
+
+/// Converts a `NaiveDate` and time components to an `ExpirationDate::DateTime`.
+fn to_expiration(date: NaiveDate, hour: u32, minute: u32) -> Result<ExpirationDate> {
+    let dt = to_datetime(date, hour, minute)?;
     Ok(ExpirationDate::DateTime(dt))
 }
 
@@ -546,6 +589,26 @@ mod tests {
             settlement_time_utc: (8, 30),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_duplicate_cycle_type() {
+        let config = ExpiryCycleConfig {
+            cycles: vec![
+                CycleRule {
+                    cycle_type: ExpiryType::Weekly,
+                    count: 2,
+                },
+                CycleRule {
+                    cycle_type: ExpiryType::Weekly,
+                    count: 3,
+                },
+            ],
+            expiry_time_utc: (8, 0),
+            settlement_time_utc: (8, 30),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
     }
 
     #[test]
@@ -775,11 +838,21 @@ mod tests {
 
     #[test]
     fn test_weekly_from_friday_skips_to_next() {
-        // from is a Friday — next weekly expiry should be the following Friday
+        // from is a Friday after expiry time — next weekly expiry should be the following Friday
         let config = single_cycle_config(ExpiryType::Weekly, 1);
-        let from = dt(2026, 3, 6, 12, 0); // 2026-03-06 is a Friday
+        let from = dt(2026, 3, 6, 12, 0); // 2026-03-06 is a Friday, 12:00 > 08:00 expiry
         let dates = config.generate_dates(from).expect("ok");
         assert_eq!(expiration_naive(&dates[0]), date(2026, 3, 13));
+    }
+
+    #[test]
+    fn test_weekly_from_friday_before_expiry_includes_today() {
+        // from is a Friday before expiry time — that Friday should be included
+        let config = single_cycle_config(ExpiryType::Weekly, 2);
+        let from = dt(2026, 3, 6, 7, 0); // 2026-03-06 is a Friday, 07:00 < 08:00 expiry
+        let dates = config.generate_dates(from).expect("ok");
+        assert_eq!(expiration_naive(&dates[0]), date(2026, 3, 6)); // same day!
+        assert_eq!(expiration_naive(&dates[1]), date(2026, 3, 13));
     }
 
     #[test]
@@ -824,6 +897,19 @@ mod tests {
         // First should be last Friday of April 2026
         let apr_last_fri = last_friday_of_month(2026, 4).expect("ok");
         assert_eq!(naive[0], apr_last_fri);
+    }
+
+    #[test]
+    fn test_monthly_from_last_friday_before_expiry_includes_today() {
+        // from is 2026-03-27 (last Friday of March) at 07:00, before 08:00 expiry
+        // That same day should be included
+        let config = single_cycle_config(ExpiryType::Monthly, 2);
+        let from = dt(2026, 3, 27, 7, 0);
+        let dates = config.generate_dates(from).expect("ok");
+        let naive: Vec<NaiveDate> = dates.iter().map(expiration_naive).collect();
+        assert_eq!(naive[0], date(2026, 3, 27)); // same day!
+        let apr_last_fri = last_friday_of_month(2026, 4).expect("ok");
+        assert_eq!(naive[1], apr_last_fri);
     }
 
     #[test]
