@@ -58,6 +58,7 @@ mod instrument_status;
 mod quote;
 mod stp;
 mod strike;
+mod strike_generator;
 mod strike_range;
 pub mod symbol_index;
 mod underlying;
@@ -78,6 +79,7 @@ pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+pub use strike_generator::StrikeGenerator;
 pub use strike_range::{ExpiryType, StrikeRangeConfig, StrikeRangeConfigBuilder};
 pub use symbol_index::{SymbolIndex, SymbolRef};
 pub use underlying::{
