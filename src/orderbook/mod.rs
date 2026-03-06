@@ -51,6 +51,7 @@ mod book;
 mod chain;
 mod contract_specs;
 mod expiration;
+mod expiry_cycle;
 mod fees;
 mod instrument_registry;
 mod instrument_status;
@@ -72,6 +73,7 @@ pub use expiration::{
     ExpirationManagerStats, ExpirationMassCancelResult, ExpirationOrderBook,
     ExpirationOrderBookManager,
 };
+pub use expiry_cycle::{CycleRule, ExpiryCycleConfig};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};

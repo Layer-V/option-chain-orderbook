@@ -7,6 +7,7 @@ use super::contract_specs::ContractSpecs;
 use super::expiration::{
     ExpirationMassCancelResult, ExpirationOrderBook, ExpirationOrderBookManager,
 };
+use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
@@ -50,6 +51,8 @@ pub struct UnderlyingOrderBook {
     symbol_index: Option<Arc<SymbolIndex>>,
     /// Strike range configurations per expiry type.
     strike_range_configs: SharedStrikeRangeConfigs,
+    /// Expiry cycle configuration for automatic expiration date generation.
+    expiry_cycle_config: SharedExpiryCycleConfig,
 }
 
 /// Underlying-level mass cancel summary.
@@ -172,6 +175,7 @@ impl UnderlyingOrderBook {
             registry: None,
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
+            expiry_cycle_config: SharedExpiryCycleConfig::new(),
         }
     }
 
@@ -201,6 +205,7 @@ impl UnderlyingOrderBook {
             registry: Some(registry),
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
+            expiry_cycle_config: SharedExpiryCycleConfig::new(),
         }
     }
 
@@ -231,6 +236,7 @@ impl UnderlyingOrderBook {
             registry: Some(registry),
             symbol_index: Some(symbol_index),
             strike_range_configs: SharedStrikeRangeConfigs::new(),
+            expiry_cycle_config: SharedExpiryCycleConfig::new(),
         }
     }
 
@@ -413,6 +419,61 @@ impl UnderlyingOrderBook {
     /// Clears all strike range configurations for this underlying.
     pub fn clear_strike_range_configs(&self) {
         self.strike_range_configs.clear();
+    }
+
+    /// Sets the expiry cycle configuration for this underlying.
+    ///
+    /// The configuration is validated before being stored. It determines which
+    /// expiration dates are auto-created and when they expire.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The expiry cycle configuration to store
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ConfigurationError` if the config is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use option_chain_orderbook::orderbook::{UnderlyingOrderBook, ExpiryCycleConfig};
+    ///
+    /// let book = UnderlyingOrderBook::new("BTC");
+    /// book.set_expiry_cycle_config(ExpiryCycleConfig::default())
+    ///     .expect("default config should be valid");
+    /// ```
+    #[inline]
+    pub fn set_expiry_cycle_config(&self, config: ExpiryCycleConfig) -> Result<()> {
+        config.validate()?;
+        self.expiry_cycle_config.set(config);
+        Ok(())
+    }
+
+    /// Returns the current expiry cycle configuration, or `None` if unset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use option_chain_orderbook::orderbook::{UnderlyingOrderBook, ExpiryCycleConfig};
+    ///
+    /// let book = UnderlyingOrderBook::new("BTC");
+    /// assert!(book.expiry_cycle_config().is_none());
+    /// book.set_expiry_cycle_config(ExpiryCycleConfig::default()).expect("valid");
+    /// assert!(book.expiry_cycle_config().is_some());
+    /// ```
+    #[must_use]
+    #[inline]
+    pub fn expiry_cycle_config(&self) -> Option<ExpiryCycleConfig> {
+        self.expiry_cycle_config.get()
+    }
+
+    /// Clears the expiry cycle configuration for this underlying.
+    ///
+    /// After this call, [`expiry_cycle_config`](Self::expiry_cycle_config) returns `None`.
+    #[inline]
+    pub fn clear_expiry_cycle_config(&self) {
+        self.expiry_cycle_config.clear();
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.
