@@ -10,6 +10,7 @@ use super::expiration::{
 use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
+use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
 use super::symbol_index::SymbolIndex;
 use super::validation::ValidationConfig;
 use crate::error::{Error, Result};
@@ -17,6 +18,7 @@ use crossbeam_skiplist::SkipMap;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +48,8 @@ pub struct UnderlyingOrderBook {
     /// Stored for future use in hierarchy traversal.
     #[allow(dead_code)]
     symbol_index: Option<Arc<SymbolIndex>>,
+    /// Strike range configurations per expiry type.
+    strike_range_configs: SharedStrikeRangeConfigs,
 }
 
 /// Underlying-level mass cancel summary.
@@ -167,6 +171,7 @@ impl UnderlyingOrderBook {
             underlying,
             registry: None,
             symbol_index: None,
+            strike_range_configs: SharedStrikeRangeConfigs::new(),
         }
     }
 
@@ -195,6 +200,7 @@ impl UnderlyingOrderBook {
             underlying,
             registry: Some(registry),
             symbol_index: None,
+            strike_range_configs: SharedStrikeRangeConfigs::new(),
         }
     }
 
@@ -224,6 +230,7 @@ impl UnderlyingOrderBook {
             underlying,
             registry: Some(registry),
             symbol_index: Some(symbol_index),
+            strike_range_configs: SharedStrikeRangeConfigs::new(),
         }
     }
 
@@ -322,6 +329,78 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn fee_schedule(&self) -> Option<FeeSchedule> {
         self.expirations.fee_schedule()
+    }
+
+    /// Sets the strike range configuration for a specific expiry type.
+    ///
+    /// This configuration determines how strikes are generated around the ATM
+    /// price for the given expiration type.
+    ///
+    /// # Arguments
+    ///
+    /// * `expiry_type` - The expiration type to configure
+    /// * `config` - The strike range configuration
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use option_chain_orderbook::orderbook::{UnderlyingOrderBook, ExpiryType, StrikeRangeConfig};
+    ///
+    /// let book = UnderlyingOrderBook::new("BTC");
+    /// let config = StrikeRangeConfig::builder()
+    ///     .range_pct(0.15)
+    ///     .strike_interval(1000)
+    ///     .build()
+    ///     .expect("valid config");
+    ///
+    /// book.set_strike_range_config(ExpiryType::Weekly, config);
+    /// ```
+    #[inline]
+    pub fn set_strike_range_config(&self, expiry_type: ExpiryType, config: StrikeRangeConfig) {
+        self.strike_range_configs.set(expiry_type, config);
+    }
+
+    /// Returns the strike range configuration for a specific expiry type.
+    ///
+    /// # Arguments
+    ///
+    /// * `expiry_type` - The expiration type to query
+    ///
+    /// # Returns
+    ///
+    /// The configuration if set, or `None` if no configuration exists for this type.
+    #[must_use]
+    #[inline]
+    pub fn strike_range_config(&self, expiry_type: ExpiryType) -> Option<StrikeRangeConfig> {
+        self.strike_range_configs.get(expiry_type)
+    }
+
+    /// Returns all strike range configurations for this underlying.
+    ///
+    /// # Returns
+    ///
+    /// A map of expiry type to configuration.
+    #[must_use]
+    pub fn strike_range_configs(&self) -> HashMap<ExpiryType, StrikeRangeConfig> {
+        self.strike_range_configs.get_all()
+    }
+
+    /// Removes the strike range configuration for a specific expiry type.
+    ///
+    /// # Arguments
+    ///
+    /// * `expiry_type` - The expiration type to remove
+    ///
+    /// # Returns
+    ///
+    /// The removed configuration if it existed.
+    pub fn remove_strike_range_config(&self, expiry_type: ExpiryType) -> Option<StrikeRangeConfig> {
+        self.strike_range_configs.remove(expiry_type)
+    }
+
+    /// Clears all strike range configurations for this underlying.
+    pub fn clear_strike_range_configs(&self) {
+        self.strike_range_configs.clear();
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.
