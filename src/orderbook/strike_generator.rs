@@ -115,8 +115,8 @@ impl StrikeGenerator {
         let low_f64 = spot_f64 * (1.0 - range_pct);
         let high_f64 = spot_f64 * (1.0 + range_pct);
 
-        // Convert to u64, clamping negative to 0
-        let low = if low_f64 < 0.0 { 0u64 } else { low_f64 as u64 };
+        // Convert to u64; range_pct is validated to (0,1] so low_f64 is non-negative
+        let low = low_f64 as u64;
         let high = high_f64 as u64;
 
         // Floor low to interval multiple
@@ -138,12 +138,29 @@ impl StrikeGenerator {
             strike = interval;
         }
 
-        while strike <= high_strike && strikes.len() < max_strikes {
+        while strike <= high_strike {
             strikes.push(strike);
             strike = match strike.checked_add(interval) {
                 Some(s) => s,
                 None => break, // Overflow, stop generating
             };
+        }
+
+        // Cap at max_strikes by selecting ATM-centered window
+        if strikes.len() > max_strikes {
+            // Find ATM index or closest strike
+            let atm_idx = strikes
+                .iter()
+                .position(|&s| s >= atm)
+                .unwrap_or(strikes.len().saturating_sub(1));
+
+            // Select centered window around ATM
+            let half = max_strikes / 2;
+            let start = atm_idx.saturating_sub(half);
+            let end = (start + max_strikes).min(strikes.len());
+            let start = end.saturating_sub(max_strikes);
+
+            strikes = strikes[start..end].to_vec();
         }
 
         // Expand symmetrically if below min_strikes
@@ -222,7 +239,7 @@ impl StrikeGenerator {
     /// ```
     pub fn apply_strikes(chain: &OptionChainOrderBook, strikes: &[u64]) {
         for &strike in strikes {
-            drop(chain.get_or_create_strike(strike));
+            let _ = chain.get_or_create_strike(strike);
         }
     }
 

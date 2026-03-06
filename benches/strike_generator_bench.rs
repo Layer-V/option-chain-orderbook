@@ -83,7 +83,8 @@ pub fn strike_generator_scaling(c: &mut Criterion) {
             num_strikes,
             |b, &num_strikes| {
                 // Configure to generate approximately num_strikes
-                let range_pct = (num_strikes as f64 * 100.0) / 50000.0;
+                // Formula: range_pct = (num_strikes - 1) * interval / (2 * spot)
+                let range_pct = ((num_strikes - 1) as f64 * 100.0) / (2.0 * 50000.0);
                 let config = StrikeRangeConfig::builder()
                     .range_pct(range_pct.min(1.0))
                     .strike_interval(100)
