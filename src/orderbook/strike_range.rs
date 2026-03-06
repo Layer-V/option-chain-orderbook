@@ -31,9 +31,8 @@ use std::sync::RwLock;
 /// let config = expiry.default_config();
 /// assert!((config.range_pct() - 0.10).abs() < f64::EPSILON);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(u8)]
-#[derive(Default)]
 pub enum ExpiryType {
     /// Daily expiration (0-1 DTE).
     Daily = 0,
@@ -340,7 +339,8 @@ impl StrikeRangeConfigBuilder {
     ///
     /// Use this only when you are certain the values are valid.
     #[must_use]
-    pub fn build_unchecked(self) -> StrikeRangeConfig {
+    #[allow(dead_code)]
+    pub(crate) fn build_unchecked(self) -> StrikeRangeConfig {
         self.inner
     }
 }

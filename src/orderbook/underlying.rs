@@ -334,12 +334,17 @@ impl UnderlyingOrderBook {
     /// Sets the strike range configuration for a specific expiry type.
     ///
     /// This configuration determines how strikes are generated around the ATM
-    /// price for the given expiration type.
+    /// price for the given expiration type. The configuration is validated
+    /// before being stored.
     ///
     /// # Arguments
     ///
     /// * `expiry_type` - The expiration type to configure
     /// * `config` - The strike range configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ConfigurationError` if the config is invalid.
     ///
     /// # Examples
     ///
@@ -353,11 +358,18 @@ impl UnderlyingOrderBook {
     ///     .build()
     ///     .expect("valid config");
     ///
-    /// book.set_strike_range_config(ExpiryType::Weekly, config);
+    /// book.set_strike_range_config(ExpiryType::Weekly, config)
+    ///     .expect("config should be valid");
     /// ```
     #[inline]
-    pub fn set_strike_range_config(&self, expiry_type: ExpiryType, config: StrikeRangeConfig) {
+    pub fn set_strike_range_config(
+        &self,
+        expiry_type: ExpiryType,
+        config: StrikeRangeConfig,
+    ) -> Result<()> {
+        config.validate()?;
         self.strike_range_configs.set(expiry_type, config);
+        Ok(())
     }
 
     /// Returns the strike range configuration for a specific expiry type.
