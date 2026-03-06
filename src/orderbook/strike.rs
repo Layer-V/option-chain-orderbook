@@ -9,6 +9,7 @@ use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
 use super::stp::SharedSTPMode;
+use super::symbol_index::{SymbolIndex, SymbolRef};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crate::utils::format_expiration_yyyymmdd;
@@ -697,6 +698,8 @@ pub struct StrikeOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry for allocating IDs to new option books.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode applied to newly created option books.
     stp_mode: SharedSTPMode,
     /// Fee schedule applied to newly created option books.
@@ -719,6 +722,7 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -747,6 +751,35 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            symbol_index: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Creates a new strike order book manager with both instrument registry and symbol index.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        Self {
+            strikes: SkipMap::new(),
+            underlying: underlying.into(),
+            expiration,
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -927,14 +960,15 @@ impl StrikeOrderBookManager {
     }
 
     /// Assigns unique instrument IDs and registers the call/put books in the
-    /// reverse index. Called only after confirming this book won the insertion race.
+    /// reverse index. Also registers symbols in the symbol index if present.
+    /// Called only after confirming this book won the insertion race.
     fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) {
-        if let Some(reg) = &self.registry {
-            let exp_str = format_expiration_yyyymmdd(&self.expiration)
-                .unwrap_or_else(|_| self.expiration.to_string());
-            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+        let exp_str = format_expiration_yyyymmdd(&self.expiration)
+            .unwrap_or_else(|_| self.expiration.to_string());
+        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
 
+        if let Some(reg) = &self.registry {
             let call_id = reg.allocate();
             let put_id = reg.allocate();
 
@@ -950,6 +984,15 @@ impl StrikeOrderBookManager {
                 self.expiration,
                 strike,
             );
+        }
+
+        if let Some(idx) = &self.symbol_index {
+            let call_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Call);
+            let put_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Put);
+            idx.register(&call_symbol, call_ref);
+            idx.register(&put_symbol, put_ref);
         }
     }
 
@@ -998,11 +1041,20 @@ impl StrikeOrderBookManager {
         self.strikes.iter()
     }
 
-    /// Removes a strike order book.
+    /// Removes a strike order book and deregisters its symbols from the index.
     ///
     /// Note: Returns true if the strike was removed, false if it didn't exist.
     pub fn remove(&self, strike: u64) -> bool {
-        self.strikes.remove(&strike).is_some()
+        let removed = self.strikes.remove(&strike).is_some();
+        if removed && let Some(idx) = &self.symbol_index {
+            let exp_str = format_expiration_yyyymmdd(&self.expiration)
+                .unwrap_or_else(|_| self.expiration.to_string());
+            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            idx.deregister(&call_symbol);
+            idx.deregister(&put_symbol);
+        }
+        removed
     }
 
     /// Returns all strike prices (sorted).

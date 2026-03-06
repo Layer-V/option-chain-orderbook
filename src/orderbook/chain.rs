@@ -8,6 +8,7 @@ use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
 use super::strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+use super::symbol_index::SymbolIndex;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
@@ -43,6 +44,10 @@ pub struct OptionChainOrderBook {
     id: OrderId,
     /// Instrument registry propagated to strike managers.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    /// Stored for future use in hierarchy traversal.
+    #[allow(dead_code)]
+    symbol_index: Option<Arc<SymbolIndex>>,
 }
 
 impl OptionChainOrderBook {
@@ -62,6 +67,7 @@ impl OptionChainOrderBook {
             expiration,
             id: OrderId::new(),
             registry: None,
+            symbol_index: None,
         }
     }
 
@@ -93,6 +99,39 @@ impl OptionChainOrderBook {
             expiration,
             id: OrderId::new(),
             registry: Some(registry),
+            symbol_index: None,
+        }
+    }
+
+    /// Creates a new option chain order book with both instrument registry and symbol index.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            strikes: Arc::new(StrikeOrderBookManager::new_with_registry_and_index(
+                &underlying,
+                expiration,
+                Arc::clone(&registry),
+                Arc::clone(&symbol_index),
+            )),
+            underlying,
+            expiration,
+            id: OrderId::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
         }
     }
 

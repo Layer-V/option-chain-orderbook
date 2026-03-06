@@ -9,6 +9,7 @@ use super::fees::SharedFeeSchedule;
 use super::instrument_registry::InstrumentRegistry;
 use super::stp::SharedSTPMode;
 use super::strike::StrikeOrderBook;
+use super::symbol_index::SymbolIndex;
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crossbeam_skiplist::SkipMap;
@@ -43,6 +44,10 @@ pub struct ExpirationOrderBook {
     id: OrderId,
     /// Instrument registry propagated to the chain.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    /// Stored for future use in hierarchy traversal.
+    #[allow(dead_code)]
+    symbol_index: Option<Arc<SymbolIndex>>,
 }
 
 impl ExpirationOrderBook {
@@ -62,6 +67,7 @@ impl ExpirationOrderBook {
             expiration,
             id: OrderId::new(),
             registry: None,
+            symbol_index: None,
         }
     }
 
@@ -93,6 +99,39 @@ impl ExpirationOrderBook {
             expiration,
             id: OrderId::new(),
             registry: Some(registry),
+            symbol_index: None,
+        }
+    }
+
+    /// Creates a new expiration order book with both instrument registry and symbol index.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        let underlying = underlying.into();
+
+        Self {
+            chain: Arc::new(OptionChainOrderBook::new_with_registry_and_index(
+                &underlying,
+                expiration,
+                Arc::clone(&registry),
+                Arc::clone(&symbol_index),
+            )),
+            underlying,
+            expiration,
+            id: OrderId::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
         }
     }
 
@@ -501,6 +540,8 @@ pub struct ExpirationOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry propagated to newly created expiration books.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode propagated to newly created expiration books.
     stp_mode: SharedSTPMode,
     /// Fee schedule propagated to newly created expiration books.
@@ -521,6 +562,7 @@ impl ExpirationOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -536,6 +578,7 @@ impl ExpirationOrderBookManager {
     /// * `underlying` - The underlying asset symbol
     /// * `registry` - The instrument registry for ID allocation
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn new_with_registry(
         underlying: impl Into<String>,
         registry: Arc<InstrumentRegistry>,
@@ -546,6 +589,32 @@ impl ExpirationOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            symbol_index: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Creates a new expiration order book manager with both instrument registry and symbol index.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        Self {
+            expirations: SkipMap::new(),
+            underlying: underlying.into(),
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -646,14 +715,19 @@ impl ExpirationOrderBookManager {
         if let Some(entry) = self.expirations.get(&expiration) {
             return Arc::clone(entry.value());
         }
-        let book = if let Some(ref reg) = self.registry {
-            Arc::new(ExpirationOrderBook::new_with_registry(
+        let book = match (&self.registry, &self.symbol_index) {
+            (Some(reg), Some(idx)) => Arc::new(ExpirationOrderBook::new_with_registry_and_index(
                 &self.underlying,
                 expiration,
                 Arc::clone(reg),
-            ))
-        } else {
-            Arc::new(ExpirationOrderBook::new(&self.underlying, expiration))
+                Arc::clone(idx),
+            )),
+            (Some(reg), None) => Arc::new(ExpirationOrderBook::new_with_registry(
+                &self.underlying,
+                expiration,
+                Arc::clone(reg),
+            )),
+            _ => Arc::new(ExpirationOrderBook::new(&self.underlying, expiration)),
         };
         if let Some(ref config) = self.validation_config.get() {
             book.set_validation(config.clone());

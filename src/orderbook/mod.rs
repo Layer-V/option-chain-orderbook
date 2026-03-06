@@ -57,6 +57,7 @@ mod instrument_status;
 mod quote;
 mod stp;
 mod strike;
+pub mod symbol_index;
 mod underlying;
 mod validation;
 
@@ -74,6 +75,7 @@ pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+pub use symbol_index::{SymbolIndex, SymbolRef};
 pub use underlying::{
     GlobalMassCancelResult, GlobalStats, UnderlyingMassCancelResult, UnderlyingOrderBook,
     UnderlyingOrderBookManager, UnderlyingStats,
