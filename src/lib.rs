@@ -220,5 +220,7 @@ pub mod orderbook;
 pub mod utils;
 
 pub use error::{Error, Result};
-pub use orderbook::{SymbolIndex, SymbolRef};
+pub use orderbook::{
+    ExpiryType, StrikeRangeConfig, StrikeRangeConfigBuilder, SymbolIndex, SymbolRef,
+};
 pub use utils::{ParsedSymbol, SymbolParser};
