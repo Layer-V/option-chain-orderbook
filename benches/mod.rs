@@ -14,6 +14,7 @@ mod expiration_bench;
 mod hierarchy_bench;
 mod orderbook_bench;
 mod strike_bench;
+mod strike_generator_bench;
 mod underlying_bench;
 
 use criterion::{criterion_group, criterion_main};
@@ -65,11 +66,19 @@ criterion_group!(
     hierarchy_bench::hierarchy_scaling,
 );
 
+// StrikeGenerator benchmarks
+criterion_group!(
+    strike_generator_benches,
+    strike_generator_bench::strike_generator_operations,
+    strike_generator_bench::strike_generator_scaling,
+);
+
 criterion_main!(
     orderbook_benches,
     strike_benches,
     chain_benches,
     expiration_benches,
     underlying_benches,
-    hierarchy_benches
+    hierarchy_benches,
+    strike_generator_benches
 );
