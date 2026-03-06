@@ -840,6 +840,13 @@ impl UnderlyingOrderBookManager {
     ///
     /// Returns `Error::SymbolNotFound` if the symbol is not registered.
     /// Returns hierarchy errors if the underlying/expiration/strike no longer exists.
+    ///
+    /// # Note
+    ///
+    /// There is a potential race condition: if a strike is removed between the
+    /// index lookup and the hierarchy traversal, this method returns
+    /// `StrikeNotFound` rather than `SymbolNotFound`. This is acceptable since
+    /// strike removal is rare and the symbol is correctly deregistered.
     pub fn get_by_symbol(&self, symbol: &str) -> Result<Arc<super::book::OptionOrderBook>> {
         let sym_ref = self
             .symbol_index

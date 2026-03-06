@@ -138,14 +138,19 @@ impl SymbolIndex {
 
     /// Registers a symbol in the index.
     ///
-    /// If the symbol already exists, it is overwritten.
+    /// If the symbol already exists, it is overwritten and this method
+    /// returns `true` to indicate a duplicate registration occurred.
     ///
     /// # Arguments
     ///
     /// * `symbol` - The full option symbol (e.g., "BTC-20260130-50000-C")
     /// * `sym_ref` - The symbol reference for hierarchy traversal
-    pub fn register(&self, symbol: impl Into<String>, sym_ref: SymbolRef) {
-        self.index.insert(symbol.into(), sym_ref);
+    ///
+    /// # Returns
+    ///
+    /// `true` if the symbol was already present (overwritten), `false` if new.
+    pub fn register(&self, symbol: impl Into<String>, sym_ref: SymbolRef) -> bool {
+        self.index.insert(symbol.into(), sym_ref).is_some()
     }
 
     /// Deregisters a symbol from the index.
