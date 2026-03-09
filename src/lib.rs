@@ -221,7 +221,7 @@ pub mod utils;
 
 pub use error::{Error, Result};
 pub use orderbook::{
-    CycleRule, ExpiryCycleConfig, ExpiryType, StrikeGenerator, StrikeRangeConfig,
-    StrikeRangeConfigBuilder, SymbolIndex, SymbolRef,
+    CycleRule, ExpirationCallback, ExpiryCycleConfig, ExpiryScheduler, ExpiryType, RefreshResult,
+    StrikeGenerator, StrikeRangeConfig, StrikeRangeConfigBuilder, SymbolIndex, SymbolRef,
 };
 pub use utils::{ParsedSymbol, SymbolParser};
