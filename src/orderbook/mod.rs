@@ -52,6 +52,7 @@ mod chain;
 mod contract_specs;
 mod expiration;
 mod expiry_cycle;
+mod expiry_lifecycle;
 mod expiry_scheduler;
 mod fees;
 mod instrument_registry;
@@ -76,6 +77,9 @@ pub use expiration::{
     ExpirationOrderBookManager,
 };
 pub use expiry_cycle::{CycleRule, ExpiryCycleConfig};
+pub use expiry_lifecycle::{
+    ExpiryLifecycleManager, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
+};
 pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;

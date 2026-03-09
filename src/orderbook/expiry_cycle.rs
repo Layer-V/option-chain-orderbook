@@ -414,7 +414,7 @@ fn advance_quarter(year: i32, q_month: u32) -> Result<(i32, u32)> {
 }
 
 /// Converts a `NaiveDate` and time components to a `DateTime<Utc>`.
-fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
+pub(crate) fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
     let naive_dt = date
         .and_hms_opt(hour, minute, 0)
         .ok_or_else(|| Error::configuration("invalid time in to_datetime"))?;
