@@ -45,7 +45,7 @@ use super::expiry_cycle::ExpiryCycleConfig;
 use super::strike_generator::StrikeGenerator;
 use super::strike_range::StrikeRangeConfig;
 use super::underlying::UnderlyingOrderBook;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use chrono::{DateTime, Utc};
 use optionstratlib::ExpirationDate;
 
@@ -118,8 +118,8 @@ impl ExpiryScheduler {
     /// # Algorithm
     ///
     /// 1. Generate expected dates from `expiry_config.generate_dates(now)`
-    /// 2. For each date, call `underlying.get_or_create_expiration(date)`
-    /// 3. If expiration has no strikes (`is_empty()`), generate them
+    /// 2. For each date, check if expiration already exists
+    /// 3. If new, create expiration and generate strikes
     /// 4. Invoke callback for each newly created expiration
     ///
     /// # Arguments
@@ -186,18 +186,22 @@ impl ExpiryScheduler {
         let mut result = RefreshResult::default();
 
         for date in expected_dates {
+            // Check if expiration already exists (not just empty)
+            let is_new = underlying.get_expiration(&date).is_err();
+
             // Get or create the expiration
             let exp = underlying.get_or_create_expiration(date);
 
-            // If expiration has no strikes, it's newly created
-            if exp.is_empty() {
+            // Only process truly new expirations (not pre-existing empty ones)
+            if is_new {
                 // Generate and apply strikes
                 let strikes =
                     StrikeGenerator::refresh_strikes(exp.chain(), spot_price, strike_config)?;
 
-                if let Some(sum) = result.strikes_generated.checked_add(strikes.len()) {
-                    result.strikes_generated = sum;
-                }
+                result.strikes_generated = result
+                    .strikes_generated
+                    .checked_add(strikes.len())
+                    .ok_or_else(|| Error::configuration("strikes_generated overflow"))?;
 
                 result.created.push(date);
 
@@ -261,20 +265,30 @@ impl ExpiryScheduler {
         spot_price: u64,
         callback: Option<&ExpirationCallback>,
     ) -> Result<RefreshResult> {
-        use crate::error::Error;
-
         // Get expiry cycle config
         let expiry_config = underlying
             .expiry_cycle_config()
             .ok_or_else(|| Error::configuration("expiry cycle config not set on underlying"))?;
 
-        // Get strike range configs - use first available or default
+        // Get strike range configs - require exactly one to avoid nondeterministic selection
         let strike_configs = underlying.strike_range_configs();
-        let strike_config = strike_configs
-            .values()
-            .next()
-            .cloned()
-            .ok_or_else(|| Error::configuration("no strike range configs set on underlying"))?;
+        let strike_config = match strike_configs.len() {
+            0 => {
+                return Err(Error::configuration(
+                    "no strike range configs set on underlying",
+                ));
+            }
+            1 => strike_configs
+                .values()
+                .next()
+                .cloned()
+                .expect("len == 1 but no value"),
+            _ => {
+                return Err(Error::configuration(
+                    "multiple strike range configs set; refresh_from_underlying requires exactly one",
+                ));
+            }
+        };
 
         Self::refresh_expirations(
             underlying,
@@ -369,11 +383,12 @@ mod tests {
         let book = UnderlyingOrderBook::new("BTC");
         let expiry_config = minimal_expiry_config();
         let strike_config = default_strike_config();
+        let now = Utc::now(); // Capture once to avoid flakiness across day boundary
 
         // First refresh
         let result1 = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             50000,
@@ -386,7 +401,7 @@ mod tests {
         // Second refresh - same config, same time
         let result2 = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             50000,
@@ -410,11 +425,12 @@ mod tests {
         let book = UnderlyingOrderBook::new("BTC");
         let expiry_config = minimal_expiry_config();
         let strike_config = default_strike_config();
+        let now = Utc::now(); // Capture once to avoid flakiness across day boundary
 
         // First refresh
         let result1 = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             50000,
@@ -437,7 +453,7 @@ mod tests {
         // Second refresh with different spot price
         let _ = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             60000, // Different spot
@@ -517,11 +533,12 @@ mod tests {
         let book = UnderlyingOrderBook::new("BTC");
         let expiry_config = minimal_expiry_config();
         let strike_config = default_strike_config();
+        let now = Utc::now(); // Capture once to avoid flakiness across day boundary
 
         // First refresh without callback
         let _ = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             50000,
@@ -539,7 +556,7 @@ mod tests {
 
         let _ = ExpiryScheduler::refresh_expirations(
             &book,
-            Utc::now(),
+            now,
             &expiry_config,
             &strike_config,
             50000,
