@@ -373,12 +373,33 @@ impl StrikeGenerator {
             ));
         }
 
-        // Compute buffered range
+        // Compute buffered range, mirroring generate_strikes behaviour:
+        // - use ceil on the floating range to avoid truncation
+        // - align low/high to strike_interval multiples
         let spot_f64 = spot as f64;
-        let range = spot_f64 * config.range_pct() * buffer_multiplier;
+        let range = (spot_f64 * config.range_pct() * buffer_multiplier).ceil();
+        let range_u64 = if range.is_finite() && range > 0.0 {
+            range as u64
+        } else {
+            0_u64
+        };
 
-        let low = spot.saturating_sub(range as u64);
-        let high = spot.saturating_add(range as u64);
+        let interval = config.strike_interval();
+
+        // First compute the raw integer bounds around spot
+        let raw_low = spot.saturating_sub(range_u64);
+        let raw_high = spot.saturating_add(range_u64);
+
+        // Floor low to the nearest strike interval
+        let low = (raw_low / interval) * interval;
+
+        // Ceil high to the nearest strike interval
+        let rem = raw_high % interval;
+        let high = if rem == 0 {
+            raw_high
+        } else {
+            raw_high.saturating_add(interval.saturating_sub(rem))
+        };
 
         let mut result = CleanupResult::default();
 
@@ -391,8 +412,9 @@ impl StrikeGenerator {
             // Strike is outside the buffered range — check if empty
             if let Ok(strike_book) = chain.get_strike(strike_price) {
                 if strike_book.is_empty() {
-                    chain.strikes().remove(strike_price);
-                    result.removed.push(strike_price);
+                    if chain.strikes().remove(strike_price) {
+                        result.removed.push(strike_price);
+                    }
                 } else {
                     result.skipped_with_orders = result.skipped_with_orders.saturating_add(1);
                 }
@@ -826,15 +848,19 @@ mod tests {
         StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
 
         // Move spot to 55000 with buffer=1.5
-        // Keep range: 55000 * 0.10 * 1.5 = 8250 → [46750, 63250]
-        // Strikes below 46750 should be removed (45000, 46000)
-        // Strikes 47000..55000 should be kept
+        // Raw range: 55000 * 0.10 * 1.5 = 8250 → raw bounds [46750, 63250]
+        // Aligned to interval: floor(46750/1000)*1000 = 46000, ceil(63250) = 64000
+        // Keep range: [46000, 64000]
+        // Strikes below 46000 should be removed (45000)
+        // Strikes 46000..55000 should be kept
         let result =
             StrikeGenerator::cleanup_empty_strikes(&chain, 55000, &config, 1.5).expect("ok");
 
-        // 45000 and 46000 are below 46750, so removed
+        // 45000 is below 46000, so removed
         assert!(result.removed.contains(&45000));
-        assert!(result.removed.contains(&46000));
+
+        // 46000 should still exist (at aligned boundary)
+        assert!(chain.get_strike(46000).is_ok());
 
         // 47000 should still exist (inside buffer)
         assert!(chain.get_strike(47000).is_ok());
@@ -859,6 +885,38 @@ mod tests {
         assert!(result.is_empty());
         assert_eq!(result.skipped_with_orders, 0);
         assert_eq!(chain.strike_count(), initial_count);
+    }
+
+    #[test]
+    fn test_cleanup_preserves_high_strike_for_non_aligned_spot() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        // Use a spot that is not aligned to the strike interval (50_123 with 1_000 interval)
+        let spot = 50_123u64;
+
+        // Generate and apply strikes for the non-aligned spot
+        StrikeGenerator::refresh_strikes(&chain, spot, &config).expect("ok");
+
+        // Identify the highest strike produced by generate_strikes for this spot
+        let strikes = StrikeGenerator::generate_strikes(spot, &config).expect("ok");
+        let high_strike = *strikes.iter().max().expect("non-empty strikes");
+
+        // Cleanup at the same spot with buffer=1.0 — the high_strike should not be removed
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, spot, &config, 1.0).expect("ok");
+
+        // Ensure that the high_strike was not removed by cleanup logic
+        assert!(
+            !result.removed.contains(&high_strike),
+            "high_strike {} should not be removed when cleaning up at the same non-aligned spot",
+            high_strike
+        );
+        assert!(
+            chain.get_strike(high_strike).is_ok(),
+            "high_strike {} should still exist in the chain after cleanup",
+            high_strike
+        );
     }
 
     #[test]
