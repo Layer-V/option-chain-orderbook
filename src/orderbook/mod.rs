@@ -81,7 +81,7 @@ pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
-pub use strike_generator::StrikeGenerator;
+pub use strike_generator::{CleanupResult, StrikeGenerator};
 pub use strike_range::{ExpiryType, StrikeRangeConfig, StrikeRangeConfigBuilder};
 pub use symbol_index::{SymbolIndex, SymbolRef};
 pub use underlying::{
