@@ -1,16 +1,23 @@
-//! Strike generation module.
+//! Strike generation and cleanup module.
 //!
 //! This module provides [`StrikeGenerator`] for computing strike prices from a
 //! spot price and [`StrikeRangeConfig`], then applying them to an
-//! [`OptionChainOrderBook`].
+//! [`OptionChainOrderBook`]. It also provides [`CleanupResult`] and a cleanup
+//! method for removing far out-of-the-money (OTM) empty strikes.
 //!
-//! ## Algorithm
+//! ## Generation Algorithm
 //!
 //! 1. Compute ATM strike by rounding spot to nearest interval
 //! 2. Compute range bounds: `spot * (1 ± range_pct)`
 //! 3. Generate strikes from low to high at interval steps
 //! 4. Cap at `max_strikes`
 //! 5. Expand symmetrically outward if below `min_strikes`
+//!
+//! ## Cleanup Algorithm
+//!
+//! 1. Compute buffered range: `spot * range_pct * buffer_multiplier`
+//! 2. For each strike outside the buffered range, remove if empty
+//! 3. Strikes with resting orders are never removed
 //!
 //! ## Example
 //!
@@ -291,12 +298,178 @@ impl StrikeGenerator {
         Self::apply_strikes(chain, &strikes);
         Ok(strikes)
     }
+
+    /// Removes empty strikes outside a buffered range around the current spot.
+    ///
+    /// Only strikes with **zero resting orders** (both call and put empty) are
+    /// removed. Strikes that have any resting orders are never removed,
+    /// regardless of how far they are from the current spot.
+    ///
+    /// The buffer multiplier widens the keep-range beyond the generation range
+    /// to prevent aggressive cleanup near boundaries. A value of `1.5` means
+    /// the cleanup range is 50% wider than the generation range.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Compute buffered range: `spot * range_pct * buffer_multiplier`
+    /// 2. Compute bounds: `[spot - range, spot + range]`
+    /// 3. For each strike outside bounds, remove if empty
+    ///
+    /// # Arguments
+    ///
+    /// * `chain` - The option chain to clean up
+    /// * `spot` - Current spot price in price units
+    /// * `config` - Strike range configuration (uses `range_pct`)
+    /// * `buffer_multiplier` - Multiplier on the range (must be ≥ 1.0)
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::ConfigurationError` if:
+    /// - `spot` is zero
+    /// - `buffer_multiplier` is not finite or less than 1.0
+    /// - `config` validation fails
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use option_chain_orderbook::orderbook::{
+    ///     OptionChainOrderBook, StrikeGenerator, StrikeRangeConfig,
+    /// };
+    /// use optionstratlib::prelude::{ExpirationDate, Positive};
+    ///
+    /// let chain = OptionChainOrderBook::new("BTC", ExpirationDate::Days(Positive::THIRTY));
+    /// let config = StrikeRangeConfig::builder()
+    ///     .range_pct(0.10)
+    ///     .strike_interval(1000)
+    ///     .min_strikes(5)
+    ///     .max_strikes(50)
+    ///     .build()
+    ///     .expect("valid config");
+    ///
+    /// // Generate strikes at spot=50000, then cleanup at spot=60000 with 1.5x buffer
+    /// StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+    /// let result = StrikeGenerator::cleanup_empty_strikes(&chain, 60000, &config, 1.5)
+    ///     .expect("ok");
+    /// ```
+    pub fn cleanup_empty_strikes(
+        chain: &OptionChainOrderBook,
+        spot: u64,
+        config: &StrikeRangeConfig,
+        buffer_multiplier: f64,
+    ) -> Result<CleanupResult> {
+        config.validate()?;
+
+        if spot == 0 {
+            return Err(Error::configuration("spot price must be positive"));
+        }
+
+        if !buffer_multiplier.is_finite() {
+            return Err(Error::configuration("buffer_multiplier must be finite"));
+        }
+
+        if buffer_multiplier < 1.0 {
+            return Err(Error::configuration(
+                "buffer_multiplier must be at least 1.0",
+            ));
+        }
+
+        // Compute buffered range, mirroring generate_strikes behaviour:
+        // - use ceil on the floating range to avoid truncation
+        // - align low/high to strike_interval multiples
+        let spot_f64 = spot as f64;
+        let range = (spot_f64 * config.range_pct() * buffer_multiplier).ceil();
+        let range_u64 = if range.is_finite() && range > 0.0 {
+            range as u64
+        } else {
+            0_u64
+        };
+
+        let interval = config.strike_interval();
+
+        // First compute the raw integer bounds around spot
+        let raw_low = spot.saturating_sub(range_u64);
+        let raw_high = spot.saturating_add(range_u64);
+
+        // Floor low to the nearest strike interval
+        let low = (raw_low / interval) * interval;
+
+        // Ceil high to the nearest strike interval
+        let rem = raw_high % interval;
+        let high = if rem == 0 {
+            raw_high
+        } else {
+            raw_high.saturating_add(interval.saturating_sub(rem))
+        };
+
+        let mut result = CleanupResult::default();
+
+        for strike_price in chain.strike_prices() {
+            // Skip strikes inside the buffered range
+            if strike_price >= low && strike_price <= high {
+                continue;
+            }
+
+            // Strike is outside the buffered range — check if empty
+            if let Ok(strike_book) = chain.get_strike(strike_price) {
+                if strike_book.is_empty() {
+                    if chain.strikes().remove(strike_price) {
+                        result.removed.push(strike_price);
+                    }
+                } else {
+                    result.skipped_with_orders = result.skipped_with_orders.saturating_add(1);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+// ─── CleanupResult ────────────────────────────────────────────────────────────
+
+/// Result of a strike cleanup operation.
+///
+/// Contains the list of removed strike prices and the count of strikes that
+/// were outside the range but had resting orders (and were therefore skipped).
+///
+/// # Examples
+///
+/// ```
+/// use option_chain_orderbook::orderbook::CleanupResult;
+///
+/// let result = CleanupResult::default();
+/// assert!(result.removed.is_empty());
+/// assert_eq!(result.skipped_with_orders, 0);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CleanupResult {
+    /// Strike prices that were removed.
+    pub removed: Vec<u64>,
+    /// Number of strikes outside range that had orders and were skipped.
+    pub skipped_with_orders: usize,
+}
+
+impl CleanupResult {
+    /// Returns true if no strikes were removed.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
+
+    /// Returns the number of strikes removed.
+    #[must_use]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.removed.len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use optionstratlib::prelude::{ExpirationDate, Positive};
+    use orderbook_rs::{OrderId, Side};
 
     fn test_expiration() -> ExpirationDate {
         ExpirationDate::Days(Positive::THIRTY)
@@ -610,6 +783,237 @@ mod tests {
         // At 1000 interval that's 27 strikes
         for &s in &strikes {
             assert_eq!(s % 1000, 0);
+        }
+    }
+
+    // ── cleanup_empty_strikes ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_cleanup_removes_empty_strikes() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config(); // 10% range, 1000 interval
+
+        // Generate strikes at spot=50000: 45000..55000
+        StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+        let initial_count = chain.strike_count();
+        assert!(initial_count > 0);
+
+        // Move spot to 70000 with buffer=1.0 (exact range)
+        // Keep range: 70000 * 0.10 * 1.0 = 7000 → [63000, 77000]
+        // All strikes 45000..55000 are below 63000, so all should be removed
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 70000, &config, 1.0).expect("ok");
+
+        assert_eq!(result.len(), initial_count);
+        assert_eq!(result.skipped_with_orders, 0);
+        assert_eq!(chain.strike_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_skips_strikes_with_orders() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        // Generate strikes at spot=50000: 45000..55000
+        StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+        let initial_count = chain.strike_count();
+
+        // Add an order to the 45000 strike (far OTM when spot moves)
+        let strike_45k = chain.get_strike(45000).expect("strike exists");
+        strike_45k
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("order added");
+
+        // Move spot to 70000 — all old strikes outside range
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 70000, &config, 1.0).expect("ok");
+
+        // 45000 should be skipped (has orders), rest removed
+        assert_eq!(result.skipped_with_orders, 1);
+        assert_eq!(
+            result.len(),
+            initial_count.checked_sub(1).expect("at least 1")
+        );
+        // 45000 should still exist
+        assert!(chain.get_strike(45000).is_ok());
+    }
+
+    #[test]
+    fn test_cleanup_buffer_prevents_aggressive_removal() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config(); // 10% range
+
+        // Generate strikes at spot=50000: 45000..55000
+        StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+
+        // Move spot to 55000 with buffer=1.5
+        // Raw range: 55000 * 0.10 * 1.5 = 8250 → raw bounds [46750, 63250]
+        // Aligned to interval: floor(46750/1000)*1000 = 46000, ceil(63250) = 64000
+        // Keep range: [46000, 64000]
+        // Strikes below 46000 should be removed (45000)
+        // Strikes 46000..55000 should be kept
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 55000, &config, 1.5).expect("ok");
+
+        // 45000 is below 46000, so removed
+        assert!(result.removed.contains(&45000));
+
+        // 46000 should still exist (at aligned boundary)
+        assert!(chain.get_strike(46000).is_ok());
+
+        // 47000 should still exist (inside buffer)
+        assert!(chain.get_strike(47000).is_ok());
+
+        // 50000 should still exist
+        assert!(chain.get_strike(50000).is_ok());
+    }
+
+    #[test]
+    fn test_cleanup_no_removals_when_all_in_range() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        // Generate strikes at spot=50000
+        StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+        let initial_count = chain.strike_count();
+
+        // Cleanup at same spot with buffer=1.5 — everything stays
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 50000, &config, 1.5).expect("ok");
+
+        assert!(result.is_empty());
+        assert_eq!(result.skipped_with_orders, 0);
+        assert_eq!(chain.strike_count(), initial_count);
+    }
+
+    #[test]
+    fn test_cleanup_preserves_high_strike_for_non_aligned_spot() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        // Use a spot that is not aligned to the strike interval (50_123 with 1_000 interval)
+        let spot = 50_123u64;
+
+        // Generate and apply strikes for the non-aligned spot
+        StrikeGenerator::refresh_strikes(&chain, spot, &config).expect("ok");
+
+        // Identify the highest strike produced by generate_strikes for this spot
+        let strikes = StrikeGenerator::generate_strikes(spot, &config).expect("ok");
+        let high_strike = *strikes.iter().max().expect("non-empty strikes");
+
+        // Cleanup at the same spot with buffer=1.0 — the high_strike should not be removed
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, spot, &config, 1.0).expect("ok");
+
+        // Ensure that the high_strike was not removed by cleanup logic
+        assert!(
+            !result.removed.contains(&high_strike),
+            "high_strike {} should not be removed when cleaning up at the same non-aligned spot",
+            high_strike
+        );
+        assert!(
+            chain.get_strike(high_strike).is_ok(),
+            "high_strike {} should still exist in the chain after cleanup",
+            high_strike
+        );
+    }
+
+    #[test]
+    fn test_cleanup_empty_chain() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 50000, &config, 1.0).expect("ok");
+
+        assert!(result.is_empty());
+        assert_eq!(result.skipped_with_orders, 0);
+    }
+
+    #[test]
+    fn test_cleanup_invalid_spot_zero() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        let result = StrikeGenerator::cleanup_empty_strikes(&chain, 0, &config, 1.5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("positive"));
+    }
+
+    #[test]
+    fn test_cleanup_invalid_buffer_below_one() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        let result = StrikeGenerator::cleanup_empty_strikes(&chain, 50000, &config, 0.5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least 1.0"));
+    }
+
+    #[test]
+    fn test_cleanup_invalid_buffer_nan() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        let result = StrikeGenerator::cleanup_empty_strikes(&chain, 50000, &config, f64::NAN);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("finite"));
+    }
+
+    #[test]
+    fn test_cleanup_invalid_buffer_infinity() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config();
+
+        let result = StrikeGenerator::cleanup_empty_strikes(&chain, 50000, &config, f64::INFINITY);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("finite"));
+    }
+
+    #[test]
+    fn test_cleanup_result_default() {
+        let result = CleanupResult::default();
+        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.skipped_with_orders, 0);
+    }
+
+    #[test]
+    fn test_cleanup_integration_generate_move_cleanup() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        let config = default_config(); // 10% range, 1000 interval
+
+        // Step 1: Generate strikes at spot=50000 → 45000..55000 (11 strikes)
+        let initial = StrikeGenerator::refresh_strikes(&chain, 50000, &config).expect("ok");
+        assert_eq!(initial.len(), 11);
+        assert_eq!(chain.strike_count(), 11);
+
+        // Step 2: Spot moves to 60000 — generate new strikes 54000..66000
+        let new = StrikeGenerator::refresh_strikes(&chain, 60000, &config).expect("ok");
+        assert!(!new.is_empty());
+        // Chain now has old + new strikes (some overlap around 54000-55000)
+        let count_before_cleanup = chain.strike_count();
+        assert!(count_before_cleanup > 11);
+
+        // Step 3: Cleanup with buffer=1.0 at spot=60000
+        // Keep range: 60000 * 0.10 * 1.0 = 6000 → [54000, 66000]
+        // Strikes below 54000 should be removed (45000..53000)
+        let result =
+            StrikeGenerator::cleanup_empty_strikes(&chain, 60000, &config, 1.0).expect("ok");
+
+        assert!(!result.is_empty());
+        // All removed strikes should be below 54000
+        for &s in &result.removed {
+            assert!(s < 54000, "removed strike {} should be below 54000", s);
+        }
+        // Verify remaining strikes are all in range
+        for s in chain.strike_prices() {
+            assert!(
+                (54000..=66000).contains(&s),
+                "remaining strike {} should be in [54000, 66000]",
+                s
+            );
         }
     }
 }
