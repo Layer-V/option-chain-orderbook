@@ -33,7 +33,7 @@
 //! let handle = tokio::runtime::Handle::current();
 //!
 //! let config = OptionChainNatsConfig::new(jetstream, "optionchain".to_string(), handle);
-//! // Use config.connect() on any hierarchy level to wire up publishers
+//! // Use underlying.connect_nats(&config) on any hierarchy level to wire up publishers
 //! # Ok(())
 //! # }
 //! ```
@@ -184,10 +184,34 @@ impl OptionChainSubjectBuilder {
             ));
         }
 
+        // Validate components for NATS subject rules
+        let underlying = parts[0];
+        let expiry = parts[1];
+        let strike = parts[2];
+
+        for (name, value) in [
+            ("underlying", underlying),
+            ("expiry", expiry),
+            ("strike", strike),
+        ] {
+            if value.is_empty() {
+                return Err(Error::invalid_symbol(
+                    symbol,
+                    format!("{} cannot be empty", name),
+                ));
+            }
+            if value.contains('.') || value.contains('*') || value.contains('>') {
+                return Err(Error::invalid_symbol(
+                    symbol,
+                    format!("{} contains invalid NATS characters", name),
+                ));
+            }
+        }
+
         Ok(Self {
-            underlying: parts[0].to_string(),
-            expiry: parts[1].to_string(),
-            strike: parts[2].to_string(),
+            underlying: underlying.to_string(),
+            expiry: expiry.to_string(),
+            strike: strike.to_string(),
             option_type,
         })
     }
@@ -207,11 +231,17 @@ impl OptionChainSubjectBuilder {
         strike: impl Into<String>,
         option_type: impl Into<String>,
     ) -> Self {
+        let mut option_type_str = option_type.into();
+        // Normalize single-character option types to uppercase for consistency
+        if option_type_str.len() == 1 {
+            option_type_str.make_ascii_uppercase();
+        }
+
         Self {
             underlying: underlying.into(),
             expiry: expiry.into(),
             strike: strike.into(),
-            option_type: option_type.into(),
+            option_type: option_type_str,
         }
     }
 
