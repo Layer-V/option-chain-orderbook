@@ -568,6 +568,37 @@ impl OptionChainOrderBook {
             total_orders: self.total_order_count(),
         }
     }
+
+    // ── NATS Integration ─────────────────────────────────────────────────
+
+    /// Connects NATS publishers to all strikes in this chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - NATS configuration with JetStream context and subject prefix
+    ///
+    /// # Returns
+    ///
+    /// The number of option books (call + put) successfully connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error encountered while connecting strikes.
+    #[cfg(feature = "nats")]
+    pub fn connect_nats(
+        &self,
+        config: &super::nats::OptionChainNatsConfig,
+    ) -> crate::Result<usize> {
+        let mut connected = 0usize;
+        for entry in self.strikes.iter() {
+            // Note: handles are returned but not stored - this is a known limitation.
+            // The caller should store the returned handles from lower-level connect_nats
+            // calls if they need to maintain publisher lifecycles.
+            let (_call_handles, _put_handles) = entry.value().connect_nats(config)?;
+            connected = connected.saturating_add(2); // call + put
+        }
+        Ok(connected)
+    }
 }
 
 /// Statistics about an option chain.

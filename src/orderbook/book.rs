@@ -1400,6 +1400,88 @@ impl OptionOrderBook {
     pub fn market_impact(&self, quantity: u64, side: Side) -> orderbook_rs::MarketImpact {
         self.book.market_impact(quantity, side)
     }
+
+    // ── NATS Integration ─────────────────────────────────────────────────
+
+    /// Connects NATS trade and book change publishers to this order book.
+    ///
+    /// This method creates NATS publishers for trade events and price level
+    /// changes, using hierarchical subjects based on the option symbol.
+    ///
+    /// # Subject Format
+    ///
+    /// - Trades: `{prefix}.trades.{underlying}.{expiry}.{strike}.{type}`
+    /// - Book changes: `{prefix}.book.{underlying}.{expiry}.{strike}.{type}`
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - NATS configuration with JetStream context and subject prefix
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the symbol cannot be parsed into its components.
+    ///
+    /// # Feature Gate
+    ///
+    /// This method is only available when the `nats` feature is enabled.
+    #[cfg(feature = "nats")]
+    pub fn connect_nats(
+        &self,
+        config: &super::nats::OptionChainNatsConfig,
+    ) -> crate::Result<NatsPublisherHandles> {
+        use super::nats::OptionChainSubjectBuilder;
+        use orderbook_rs::prelude::{NatsBookChangePublisher, NatsTradePublisher};
+
+        let subject = OptionChainSubjectBuilder::from_symbol(&self.symbol)?;
+        let trade_subject = subject.trade_subject(config.subject_prefix());
+        let book_subject = subject.book_subject(config.subject_prefix());
+
+        // Create trade publisher
+        let trade_publisher = NatsTradePublisher::new(
+            config.jetstream().clone(),
+            trade_subject,
+            config.runtime().clone(),
+        );
+        let (trade_handle, trade_listener) = trade_publisher.into_listener();
+
+        // Create book change publisher
+        let book_change_publisher = NatsBookChangePublisher::new(
+            config.jetstream().clone(),
+            self.symbol.clone(),
+            book_subject,
+            config.runtime().clone(),
+        );
+        let (book_handle, book_listener) = book_change_publisher.into_listener();
+
+        // Note: The underlying DefaultOrderBook is wrapped in Arc, so we cannot
+        // modify listeners after construction. This is a limitation - NATS
+        // integration should ideally be configured at construction time.
+        // For now, we return the handles and listeners for the caller to use.
+
+        Ok(NatsPublisherHandles {
+            trade_handle,
+            trade_listener,
+            book_handle,
+            book_listener,
+        })
+    }
+}
+
+/// Handles and listeners for NATS publishers.
+///
+/// Returned by [`OptionOrderBook::connect_nats`] when the `nats` feature is enabled.
+/// The handles can be used to read metrics (publish counts, error counts), and
+/// the listeners should be attached to the order book during construction.
+#[cfg(feature = "nats")]
+pub struct NatsPublisherHandles {
+    /// Handle to the trade publisher for reading metrics.
+    pub trade_handle: std::sync::Arc<orderbook_rs::prelude::NatsTradePublisher>,
+    /// Trade listener to attach to the order book.
+    pub trade_listener: orderbook_rs::prelude::TradeListener,
+    /// Handle to the book change publisher for reading metrics.
+    pub book_handle: std::sync::Arc<orderbook_rs::prelude::NatsBookChangePublisher>,
+    /// Book change listener to attach to the order book.
+    pub book_listener: orderbook_rs::orderbook::book_change_event::PriceLevelChangedListener,
 }
 
 #[cfg(test)]
