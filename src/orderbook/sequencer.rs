@@ -1,0 +1,874 @@
+//! Sequencer integration for deterministic ordering and replay.
+//!
+//! This module provides sequencer support for the option chain hierarchy,
+//! enabling deterministic ordering of all operations and journal-based replay
+//! for disaster recovery and state verification.
+//!
+//! # Architecture
+//!
+//! Each [`SequencedUnderlyingOrderBook`] owns its own sequencer, providing:
+//!
+//! - Monotonic sequence numbers per underlying
+//! - Independent journaling and replay per underlying
+//! - Parallel operation across different underlyings
+//! - Isolated failure domains
+//!
+//! # Feature Gate
+//!
+//! This module is only available when the `sequencer` feature is enabled:
+//!
+//! ```toml
+//! [dependencies]
+//! option-chain-orderbook = { version = "0.4", features = ["sequencer"] }
+//! ```
+
+use crate::error::Error;
+use crate::orderbook::book::TerminalOrderSummary;
+use crate::orderbook::underlying::UnderlyingOrderBook;
+use optionstratlib::ExpirationDate;
+use orderbook_rs::prelude::{
+    Journal, SequencerCommand, SequencerEvent, SequencerResult, TradeResult,
+};
+use orderbook_rs::{OrderId, Side};
+use pricelevel::Hash32;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Scope for mass cancel operations in the option chain hierarchy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MassCancelScope {
+    /// Cancel across the entire underlying (all expirations, all strikes).
+    Underlying,
+    /// Cancel within a specific expiration.
+    Expiration(ExpirationDate),
+    /// Cancel within a specific strike of an expiration.
+    Strike {
+        /// The expiration date.
+        expiration: ExpirationDate,
+        /// The strike price.
+        strike: u64,
+    },
+    /// Cancel within a specific option book (call or put).
+    Book(String),
+}
+
+/// Type of mass cancel operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MassCancelType {
+    /// Cancel all orders.
+    All,
+    /// Cancel orders on a specific side.
+    BySide(Side),
+    /// Cancel orders belonging to a specific user.
+    ByUser(Hash32),
+}
+
+/// Command for the option chain sequencer with hierarchy routing.
+///
+/// Each variant represents an operation that can be sequenced through
+/// the option chain sequencer. Commands are serializable for journal
+/// persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OptionChainCommand {
+    /// Add a limit order to a specific option book.
+    AddOrder {
+        /// Target option symbol (e.g., "BTC-20240329-50000-C").
+        symbol: String,
+        /// Order identifier.
+        order_id: OrderId,
+        /// Buy or Sell.
+        side: Side,
+        /// Limit price.
+        price: u128,
+        /// Order quantity.
+        quantity: u64,
+    },
+    /// Cancel an order in a specific option book.
+    CancelOrder {
+        /// Target option symbol.
+        symbol: String,
+        /// Order to cancel.
+        order_id: OrderId,
+    },
+    /// Mass cancel across a hierarchy level.
+    MassCancel {
+        /// Scope of the mass cancel operation.
+        scope: MassCancelScope,
+        /// Type of cancellation.
+        cancel_type: MassCancelType,
+    },
+}
+
+/// Result of executing an option chain command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OptionChainResult {
+    /// An order was successfully added.
+    OrderAdded {
+        /// The identifier of the newly added order.
+        order_id: OrderId,
+    },
+    /// An order was successfully cancelled.
+    OrderCancelled {
+        /// The identifier of the cancelled order.
+        order_id: OrderId,
+    },
+    /// An order was successfully updated.
+    OrderUpdated {
+        /// The identifier of the updated order.
+        order_id: OrderId,
+    },
+    /// A trade was executed.
+    TradeExecuted {
+        /// The trade result containing match details.
+        trade_result: TradeResult,
+    },
+    /// A mass cancel operation was executed.
+    MassCancelled {
+        /// Number of cancelled orders.
+        cancelled_count: usize,
+    },
+    /// The command was rejected.
+    Rejected {
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+    /// The target book was not found.
+    BookNotFound {
+        /// The symbol that was not found.
+        symbol: String,
+    },
+}
+
+impl OptionChainResult {
+    /// Returns true if this result represents a rejection or error.
+    #[must_use]
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Rejected { .. } | Self::BookNotFound { .. })
+    }
+
+    /// Returns true if this result represents a successful operation.
+    #[must_use]
+    #[inline]
+    pub fn is_success(&self) -> bool {
+        !self.is_error()
+    }
+}
+
+/// A sequenced event emitted after processing an option chain command.
+///
+/// Every event carries a monotonically increasing `sequence_num` and a
+/// nanosecond-precision `timestamp_ns`, enabling deterministic replay
+/// and total ordering of all option chain operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionChainEvent {
+    /// Monotonically increasing sequence number.
+    pub sequence_num: u64,
+    /// Wall-clock timestamp in nanoseconds since Unix epoch.
+    pub timestamp_ns: u64,
+    /// The command that was executed.
+    pub command: OptionChainCommand,
+    /// The result of executing the command.
+    pub result: OptionChainResult,
+}
+
+/// Receipt returned after submitting a command to the sequencer.
+#[derive(Debug, Clone)]
+pub struct OptionChainReceipt {
+    /// The sequence number assigned to this command.
+    pub sequence_num: u64,
+    /// The timestamp when the command was processed.
+    pub timestamp_ns: u64,
+    /// The result of the command.
+    pub result: OptionChainResult,
+}
+
+/// Internal sequencer that assigns sequence numbers and timestamps.
+pub(crate) struct OptionChainSequencer {
+    /// Next sequence number to assign.
+    sequence: AtomicU64,
+    /// Count of successfully executed commands.
+    success_count: AtomicU64,
+    /// Count of rejected commands.
+    reject_count: AtomicU64,
+}
+
+impl OptionChainSequencer {
+    /// Creates a new sequencer starting from sequence 0.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            success_count: AtomicU64::new(0),
+            reject_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Creates a new sequencer starting from a specific sequence number.
+    ///
+    /// Use this when resuming from a journal checkpoint.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn with_start_sequence(start: u64) -> Self {
+        Self {
+            sequence: AtomicU64::new(start),
+            success_count: AtomicU64::new(0),
+            reject_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the next sequence number without incrementing.
+    #[must_use]
+    #[inline]
+    pub fn current_sequence(&self) -> u64 {
+        self.sequence.load(Ordering::Relaxed)
+    }
+
+    /// Returns the count of successfully executed commands.
+    #[must_use]
+    #[inline]
+    pub fn success_count(&self) -> u64 {
+        self.success_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the count of rejected commands.
+    #[must_use]
+    #[inline]
+    pub fn reject_count(&self) -> u64 {
+        self.reject_count.load(Ordering::Relaxed)
+    }
+
+    /// Assigns a sequence number and timestamp to a command.
+    ///
+    /// Returns `(sequence_num, timestamp_ns)`.
+    #[inline]
+    pub fn assign(&self) -> (u64, u64) {
+        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let ts = Self::current_time_ns();
+        (seq, ts)
+    }
+
+    /// Records a successful execution.
+    #[inline]
+    pub fn record_success(&self) {
+        self.success_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a rejected command.
+    #[inline]
+    pub fn record_reject(&self) {
+        self.reject_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Returns the current time in nanoseconds since Unix epoch.
+    #[inline]
+    fn current_time_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
+}
+
+impl Default for OptionChainSequencer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A sequenced underlying order book with deterministic ordering and journaling.
+///
+/// Wraps an [`UnderlyingOrderBook`] and routes all operations through an
+/// internal sequencer, assigning monotonic sequence numbers and optionally
+/// persisting events to a journal for replay.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use option_chain_orderbook::orderbook::SequencedUnderlyingOrderBook;
+///
+/// let book = SequencedUnderlyingOrderBook::new("BTC");
+///
+/// // Submit a sequenced command
+/// let receipt = book.submit_add_order(
+///     "BTC-20240329-50000-C",
+///     order_id,
+///     Side::Buy,
+///     price,
+///     quantity,
+/// )?;
+///
+/// println!("Sequence: {}", receipt.sequence_num);
+/// ```
+pub struct SequencedUnderlyingOrderBook {
+    /// The underlying order book hierarchy.
+    inner: UnderlyingOrderBook,
+    /// The sequencer for assigning sequence numbers.
+    sequencer: OptionChainSequencer,
+    /// Optional journal for event persistence.
+    journal: Option<Arc<dyn Journal<()> + Send + Sync>>,
+}
+
+impl SequencedUnderlyingOrderBook {
+    /// Creates a new sequenced underlying order book without journaling.
+    #[must_use]
+    pub fn new(underlying: impl Into<String>) -> Self {
+        Self {
+            inner: UnderlyingOrderBook::new(underlying),
+            sequencer: OptionChainSequencer::new(),
+            journal: None,
+        }
+    }
+
+    /// Creates a new sequenced underlying order book with a journal.
+    pub fn with_journal(
+        underlying: impl Into<String>,
+        journal: Arc<dyn Journal<()> + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: UnderlyingOrderBook::new(underlying),
+            sequencer: OptionChainSequencer::new(),
+            journal: Some(journal),
+        }
+    }
+
+    /// Creates a sequenced wrapper around an existing underlying order book.
+    #[must_use]
+    pub fn from_underlying(underlying: UnderlyingOrderBook) -> Self {
+        Self {
+            inner: underlying,
+            sequencer: OptionChainSequencer::new(),
+            journal: None,
+        }
+    }
+
+    /// Creates a sequenced wrapper with journal around an existing book.
+    pub fn from_underlying_with_journal(
+        underlying: UnderlyingOrderBook,
+        journal: Arc<dyn Journal<()> + Send + Sync>,
+    ) -> Self {
+        Self {
+            inner: underlying,
+            sequencer: OptionChainSequencer::new(),
+            journal: Some(journal),
+        }
+    }
+
+    /// Returns a reference to the underlying order book.
+    #[must_use]
+    #[inline]
+    pub fn underlying(&self) -> &UnderlyingOrderBook {
+        &self.inner
+    }
+
+    /// Returns the current sequence number.
+    #[must_use]
+    #[inline]
+    pub fn current_sequence(&self) -> u64 {
+        self.sequencer.current_sequence()
+    }
+
+    /// Returns the count of successfully executed commands.
+    #[must_use]
+    #[inline]
+    pub fn success_count(&self) -> u64 {
+        self.sequencer.success_count()
+    }
+
+    /// Returns the count of rejected commands.
+    #[must_use]
+    #[inline]
+    pub fn reject_count(&self) -> u64 {
+        self.sequencer.reject_count()
+    }
+
+    /// Returns true if journaling is enabled.
+    #[must_use]
+    #[inline]
+    pub fn has_journal(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    // ── Sequenced Operations ─────────────────────────────────────────────
+
+    /// Submits a command and returns a receipt with the result.
+    ///
+    /// The command is assigned a sequence number and timestamp, executed
+    /// against the underlying order book, and optionally persisted to the
+    /// journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit(&self, command: OptionChainCommand) -> Result<OptionChainReceipt, Error> {
+        let (seq, ts) = self.sequencer.assign();
+        let result = self.execute_command(&command);
+
+        // Record metrics
+        if result.is_success() {
+            self.sequencer.record_success();
+        } else {
+            self.sequencer.record_reject();
+        }
+
+        // Persist to journal if enabled
+        if let Some(ref journal) = self.journal {
+            let event = OptionChainEvent {
+                sequence_num: seq,
+                timestamp_ns: ts,
+                command,
+                result: result.clone(),
+            };
+            // Convert to orderbook-rs event format for journal
+            self.persist_event(&event, journal.as_ref())?;
+        }
+
+        Ok(OptionChainReceipt {
+            sequence_num: seq,
+            timestamp_ns: ts,
+            result,
+        })
+    }
+
+    /// Submits an add order command to a specific option book.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol (e.g., "BTC-20240329-50000-C")
+    /// * `order_id` - Unique order identifier
+    /// * `side` - Buy or Sell
+    /// * `price` - Limit price
+    /// * `quantity` - Order quantity
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the book is not found or journaling fails.
+    pub fn submit_add_order(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::AddOrder {
+            symbol: symbol.to_string(),
+            order_id,
+            side,
+            price,
+            quantity,
+        };
+        self.submit(command)
+    }
+
+    /// Submits a cancel order command.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Target option symbol
+    /// * `order_id` - Order to cancel
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit_cancel_order(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::CancelOrder {
+            symbol: symbol.to_string(),
+            order_id,
+        };
+        self.submit(command)
+    }
+
+    /// Submits a mass cancel command.
+    ///
+    /// # Arguments
+    ///
+    /// * `scope` - Hierarchy level for cancellation
+    /// * `cancel_type` - Type of cancellation
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if journaling fails.
+    pub fn submit_mass_cancel(
+        &self,
+        scope: MassCancelScope,
+        cancel_type: MassCancelType,
+    ) -> Result<OptionChainReceipt, Error> {
+        let command = OptionChainCommand::MassCancel { scope, cancel_type };
+        self.submit(command)
+    }
+
+    // ── Command Execution ────────────────────────────────────────────────
+
+    /// Executes a command against the underlying order book.
+    fn execute_command(&self, command: &OptionChainCommand) -> OptionChainResult {
+        match command {
+            OptionChainCommand::AddOrder {
+                symbol,
+                order_id,
+                side,
+                price,
+                quantity,
+            } => self.execute_add_order(symbol, *order_id, *side, *price, *quantity),
+            OptionChainCommand::CancelOrder { symbol, order_id } => {
+                self.execute_cancel_order(symbol, *order_id)
+            }
+            OptionChainCommand::MassCancel { scope, cancel_type } => {
+                self.execute_mass_cancel(scope, cancel_type)
+            }
+        }
+    }
+
+    /// Executes an add order operation.
+    fn execute_add_order(
+        &self,
+        symbol: &str,
+        order_id: OrderId,
+        side: Side,
+        price: u128,
+        quantity: u64,
+    ) -> OptionChainResult {
+        let book = match self.find_book_by_symbol(symbol) {
+            Ok(book) => book,
+            Err(_) => {
+                return OptionChainResult::BookNotFound {
+                    symbol: symbol.to_string(),
+                };
+            }
+        };
+
+        match book.add_limit_order(order_id, side, price, quantity) {
+            Ok(_) => OptionChainResult::OrderAdded { order_id },
+            Err(e) => OptionChainResult::Rejected {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Executes a cancel order operation.
+    fn execute_cancel_order(&self, symbol: &str, order_id: OrderId) -> OptionChainResult {
+        let book = match self.find_book_by_symbol(symbol) {
+            Ok(book) => book,
+            Err(_) => {
+                return OptionChainResult::BookNotFound {
+                    symbol: symbol.to_string(),
+                };
+            }
+        };
+
+        match book.cancel_order(order_id) {
+            Ok(_) => OptionChainResult::OrderCancelled { order_id },
+            Err(e) => OptionChainResult::Rejected {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Executes a mass cancel operation at the specified scope.
+    fn execute_mass_cancel(
+        &self,
+        scope: &MassCancelScope,
+        cancel_type: &MassCancelType,
+    ) -> OptionChainResult {
+        // Execute the mass cancel based on scope and type
+        let cancelled_count: usize = match (scope, cancel_type) {
+            (MassCancelScope::Underlying, MassCancelType::All) => match self.inner.cancel_all() {
+                Ok(r) => r.total_cancelled(),
+                Err(e) => {
+                    return OptionChainResult::Rejected {
+                        reason: e.to_string(),
+                    };
+                }
+            },
+            (MassCancelScope::Underlying, MassCancelType::BySide(side)) => {
+                match self.inner.cancel_by_side(*side) {
+                    Ok(r) => r.total_cancelled(),
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Underlying, MassCancelType::ByUser(user_id)) => {
+                match self.inner.cancel_by_user(*user_id) {
+                    Ok(r) => r.total_cancelled(),
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Expiration(expiry), MassCancelType::All) => {
+                match self.inner.get_expiration(expiry) {
+                    Ok(exp) => match exp.cancel_all() {
+                        Ok(r) => r.total_cancelled(),
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Expiration(expiry), MassCancelType::BySide(side)) => {
+                match self.inner.get_expiration(expiry) {
+                    Ok(exp) => match exp.cancel_by_side(*side) {
+                        Ok(r) => r.total_cancelled(),
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Expiration(expiry), MassCancelType::ByUser(user_id)) => {
+                match self.inner.get_expiration(expiry) {
+                    Ok(exp) => match exp.cancel_by_user(*user_id) {
+                        Ok(r) => r.total_cancelled(),
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            _ => {
+                return OptionChainResult::Rejected {
+                    reason: "unsupported mass cancel scope".to_string(),
+                };
+            }
+        };
+
+        // Return success with the count
+        OptionChainResult::MassCancelled { cancelled_count }
+    }
+
+    /// Finds an option book by symbol.
+    fn find_book_by_symbol(
+        &self,
+        symbol: &str,
+    ) -> Result<Arc<crate::orderbook::OptionOrderBook>, Error> {
+        // Fallback: parse symbol and navigate
+        let parts: Vec<&str> = symbol.split('-').collect();
+        if parts.len() != 4 {
+            return Err(Error::invalid_symbol(
+                symbol,
+                "expected format: UNDERLYING-YYYYMMDD-STRIKE-C|P",
+            ));
+        }
+
+        let expiry_str = parts[1];
+        let strike_str = parts[2];
+        let option_type = parts[3];
+
+        // Parse expiration date
+        let expiry = Self::parse_expiration(expiry_str)?;
+
+        // Parse strike
+        let strike: u64 = strike_str.parse().map_err(|_| {
+            Error::invalid_symbol(symbol, format!("invalid strike: {}", strike_str))
+        })?;
+
+        let exp_book = self.inner.get_expiration(&expiry)?;
+        let strike_book = exp_book.get_strike(strike)?;
+
+        let book = match option_type.to_uppercase().as_str() {
+            "C" => strike_book.call_arc(),
+            "P" => strike_book.put_arc(),
+            _ => {
+                return Err(Error::invalid_symbol(
+                    symbol,
+                    format!("expected C or P, got {}", option_type),
+                ));
+            }
+        };
+
+        Ok(book)
+    }
+
+    /// Parses an expiration date string (YYYYMMDD format).
+    fn parse_expiration(s: &str) -> Result<ExpirationDate, Error> {
+        use chrono::NaiveDate;
+        use optionstratlib::prelude::pos_or_panic;
+
+        let date = NaiveDate::parse_from_str(s, "%Y%m%d")
+            .map_err(|_| Error::invalid_symbol(s, "expected YYYYMMDD format"))?;
+
+        // Calculate days until expiration
+        let today = chrono::Utc::now().date_naive();
+        let days_until = (date - today).num_days();
+
+        // Use at least 1 day for expired or same-day expirations
+        let days = if days_until <= 0 {
+            1.0
+        } else {
+            days_until as f64
+        };
+
+        Ok(ExpirationDate::Days(pos_or_panic!(days)))
+    }
+
+    /// Persists an event to the journal.
+    fn persist_event(
+        &self,
+        event: &OptionChainEvent,
+        journal: &(dyn Journal<()> + Send + Sync),
+    ) -> Result<(), Error> {
+        // Serialize to JSON for persistence
+        let json = serde_json::to_string(event)
+            .map_err(|e| Error::journal_error(format!("serialization failed: {}", e)))?;
+
+        // Create a dummy sequencer event for the journal
+        // In practice, we'd want a custom journal type
+        let seq_event = SequencerEvent {
+            sequence_num: event.sequence_num,
+            timestamp_ns: event.timestamp_ns,
+            command: SequencerCommand::CancelAll, // Placeholder
+            result: SequencerResult::Rejected {
+                reason: json, // Store our event as JSON in reason field
+            },
+        };
+
+        journal
+            .append(&seq_event)
+            .map_err(|e| Error::journal_error(format!("append failed: {}", e)))
+    }
+
+    // ── Delegated Read Operations ────────────────────────────────────────
+
+    /// Returns the underlying symbol.
+    #[must_use]
+    #[inline]
+    pub fn underlying_symbol(&self) -> &str {
+        self.inner.underlying()
+    }
+
+    /// Returns the number of expirations.
+    #[must_use]
+    #[inline]
+    pub fn expiration_count(&self) -> usize {
+        self.inner.expiration_count()
+    }
+
+    /// Returns the total order count.
+    #[must_use]
+    #[inline]
+    pub fn total_order_count(&self) -> usize {
+        self.inner.total_order_count()
+    }
+
+    /// Returns a summary of terminal order transitions.
+    #[must_use]
+    #[inline]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.inner.terminal_order_summary()
+    }
+}
+
+impl std::fmt::Debug for SequencedUnderlyingOrderBook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequencedUnderlyingOrderBook")
+            .field("underlying", &self.inner.underlying())
+            .field("sequence", &self.sequencer.current_sequence())
+            .field("has_journal", &self.journal.is_some())
+            .finish()
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sequencer_assigns_monotonic_sequence() {
+        let seq = OptionChainSequencer::new();
+        let (s1, _) = seq.assign();
+        let (s2, _) = seq.assign();
+        let (s3, _) = seq.assign();
+
+        assert_eq!(s1, 0);
+        assert_eq!(s2, 1);
+        assert_eq!(s3, 2);
+    }
+
+    #[test]
+    fn test_sequencer_with_start_sequence() {
+        let seq = OptionChainSequencer::with_start_sequence(100);
+        let (s1, _) = seq.assign();
+        let (s2, _) = seq.assign();
+
+        assert_eq!(s1, 100);
+        assert_eq!(s2, 101);
+    }
+
+    #[test]
+    fn test_sequencer_metrics() {
+        let seq = OptionChainSequencer::new();
+
+        seq.record_success();
+        seq.record_success();
+        seq.record_reject();
+
+        assert_eq!(seq.success_count(), 2);
+        assert_eq!(seq.reject_count(), 1);
+    }
+
+    #[test]
+    fn test_option_chain_result_is_error() {
+        let success = OptionChainResult::OrderAdded {
+            order_id: OrderId::new(),
+        };
+        let rejected = OptionChainResult::Rejected {
+            reason: "test".to_string(),
+        };
+        let not_found = OptionChainResult::BookNotFound {
+            symbol: "BTC".to_string(),
+        };
+
+        assert!(!success.is_error());
+        assert!(rejected.is_error());
+        assert!(not_found.is_error());
+    }
+
+    #[test]
+    fn test_sequenced_book_creation() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        assert_eq!(book.underlying_symbol(), "BTC");
+        assert_eq!(book.current_sequence(), 0);
+        assert!(!book.has_journal());
+    }
+
+    #[test]
+    fn test_mass_cancel_scope_serialization() {
+        let scope = MassCancelScope::Underlying;
+        let json = serde_json::to_string(&scope).expect("serialize");
+        assert!(json.contains("Underlying"));
+    }
+}

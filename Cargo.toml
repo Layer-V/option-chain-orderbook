@@ -43,6 +43,7 @@ pricelevel = { workspace = true }
 [features]
 default = []
 nats = ["dep:async-nats", "dep:bytes", "dep:tokio", "orderbook-rs/nats"]
+sequencer = ["dep:tokio", "orderbook-rs/journal"]
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["html_reports"] }
