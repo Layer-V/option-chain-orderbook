@@ -65,6 +65,13 @@ pub struct PriceUpdate {
     pub source: String,
 }
 
+/// Opaque handle returned by [`IndexPriceFeed::subscribe`].
+///
+/// Pass this to [`IndexPriceFeed::unsubscribe`] to remove the listener.
+/// Each id is unique within a single feed instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(u64);
+
 /// Callback invoked when a new price update is available.
 ///
 /// Receives a shared reference to the [`PriceUpdate`] to avoid cloning
@@ -104,8 +111,17 @@ pub trait IndexPriceFeed: Send + Sync {
     fn latest_price(&self) -> Option<PriceUpdate>;
 
     /// Registers a listener that will be called on every subsequent
-    /// price update. Listeners are append-only — there is no unsubscribe.
-    fn subscribe(&self, listener: PriceUpdateListener);
+    /// price update.
+    ///
+    /// Returns a [`SubscriptionId`] that can be passed to
+    /// [`unsubscribe`](Self::unsubscribe) to remove the listener.
+    fn subscribe(&self, listener: PriceUpdateListener) -> SubscriptionId;
+
+    /// Removes a previously registered listener.
+    ///
+    /// Returns `true` if the listener was found and removed, `false`
+    /// if the id was not present (e.g., already unsubscribed).
+    fn unsubscribe(&self, id: SubscriptionId) -> bool;
 
     /// Returns a human-readable identifier for this price source
     /// (e.g., `"chainlink"`, `"binance"`, `"mock"`).
@@ -142,8 +158,10 @@ pub struct MockPriceFeed {
     price: AtomicU64,
     /// Timestamp of the last price update in nanoseconds.
     timestamp_ns: AtomicU64,
+    /// Monotonically increasing counter for subscription ids.
+    next_id: AtomicU64,
     /// Registered listeners notified on each `set_price` call.
-    listeners: Mutex<Vec<PriceUpdateListener>>,
+    listeners: Mutex<Vec<(SubscriptionId, PriceUpdateListener)>>,
 }
 
 impl MockPriceFeed {
@@ -153,6 +171,7 @@ impl MockPriceFeed {
         Self {
             price: AtomicU64::new(0),
             timestamp_ns: AtomicU64::new(0),
+            next_id: AtomicU64::new(0),
             listeners: Mutex::new(Vec::new()),
         }
     }
@@ -184,7 +203,7 @@ impl MockPriceFeed {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
 
-        for listener in listeners.iter() {
+        for (_id, listener) in listeners.iter() {
             listener(&update);
         }
     }
@@ -218,11 +237,23 @@ impl IndexPriceFeed for MockPriceFeed {
         })
     }
 
-    fn subscribe(&self, listener: PriceUpdateListener) {
+    fn subscribe(&self, listener: PriceUpdateListener) -> SubscriptionId {
+        let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         match self.listeners.lock() {
-            Ok(mut listeners) => listeners.push(listener),
-            Err(poisoned) => poisoned.into_inner().push(listener),
+            Ok(mut listeners) => listeners.push((id, listener)),
+            Err(poisoned) => poisoned.into_inner().push((id, listener)),
         }
+        id
+    }
+
+    fn unsubscribe(&self, id: SubscriptionId) -> bool {
+        let mut guard = match self.listeners.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let before = guard.len();
+        guard.retain(|(sub_id, _)| *sub_id != id);
+        guard.len() < before
     }
 
     fn source(&self) -> &str {
@@ -296,10 +327,16 @@ impl IndexPriceFeed for StaticPriceFeed {
         })
     }
 
-    fn subscribe(&self, _listener: PriceUpdateListener) {
+    fn subscribe(&self, _listener: PriceUpdateListener) -> SubscriptionId {
         // StaticPriceFeed never changes its price and never notifies listeners.
         // Accept the listener to satisfy the trait contract, then drop it to
         // avoid unbounded growth of an unused listener list.
+        SubscriptionId(0)
+    }
+
+    fn unsubscribe(&self, _id: SubscriptionId) -> bool {
+        // StaticPriceFeed never stores listeners, so nothing to remove.
+        false
     }
 
     fn source(&self) -> &str {
@@ -316,8 +353,8 @@ impl IndexPriceFeed for StaticPriceFeed {
 /// on the calculator whenever a new price arrives. Also seeds the
 /// calculator with the feed's current latest price, if available.
 ///
-/// Returns the listener so the caller can keep a reference if needed
-/// (e.g., for diagnostics or future unsubscribe support).
+/// Returns a [`SubscriptionId`] that can be passed to
+/// [`IndexPriceFeed::unsubscribe`] to disconnect the wiring.
 ///
 /// # Arguments
 ///
@@ -335,15 +372,18 @@ impl IndexPriceFeed for StaticPriceFeed {
 /// let feed = Arc::new(MockPriceFeed::new());
 /// let calc = Arc::new(MarkPriceCalculator::with_default_config());
 ///
-/// let _listener = wire_feed_to_calculator(feed.as_ref(), Arc::clone(&calc));
+/// let sub_id = wire_feed_to_calculator(feed.as_ref(), Arc::clone(&calc));
 ///
 /// feed.set_price(99000);
 /// assert_eq!(calc.index_price(), 99000);
+///
+/// // Disconnect the wiring
+/// feed.unsubscribe(sub_id);
 /// ```
 pub fn wire_feed_to_calculator(
     feed: &dyn IndexPriceFeed,
     calculator: Arc<MarkPriceCalculator>,
-) -> PriceUpdateListener {
+) -> SubscriptionId {
     // Seed with current price if available
     if let Some(update) = feed.latest_price() {
         calculator.update_index_price(update.price);
@@ -354,9 +394,7 @@ pub fn wire_feed_to_calculator(
         calculator.update_index_price(update.price);
     });
 
-    feed.subscribe(Arc::clone(&listener));
-
-    listener
+    feed.subscribe(listener)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -660,6 +698,107 @@ mod tests {
 
         // Calculator should have received the last update
         assert!(calc.index_price() > 0);
+    }
+
+    // ── Unsubscribe ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_unsubscribe_stops_notifications() {
+        let feed = MockPriceFeed::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+
+        let id = feed.subscribe(Arc::new(move |_: &PriceUpdate| {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        feed.set_price(100);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+
+        // Unsubscribe
+        assert!(feed.unsubscribe(id));
+
+        // Should no longer receive updates
+        feed.set_price(200);
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_unsubscribe_returns_false_for_unknown_id() {
+        let feed = MockPriceFeed::new();
+        assert!(!feed.unsubscribe(SubscriptionId(999)));
+    }
+
+    #[test]
+    fn test_unsubscribe_idempotent() {
+        let feed = MockPriceFeed::new();
+        let id = feed.subscribe(Arc::new(|_: &PriceUpdate| {}));
+
+        assert!(feed.unsubscribe(id));
+        // Second call returns false — already removed
+        assert!(!feed.unsubscribe(id));
+    }
+
+    #[test]
+    fn test_unsubscribe_one_of_many() {
+        let feed = MockPriceFeed::new();
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let count_a_clone = Arc::clone(&count_a);
+        let id_a = feed.subscribe(Arc::new(move |_: &PriceUpdate| {
+            count_a_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let count_b_clone = Arc::clone(&count_b);
+        let _id_b = feed.subscribe(Arc::new(move |_: &PriceUpdate| {
+            count_b_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        feed.set_price(100);
+        assert_eq!(count_a.load(Ordering::Relaxed), 1);
+        assert_eq!(count_b.load(Ordering::Relaxed), 1);
+
+        // Remove only listener A
+        feed.unsubscribe(id_a);
+
+        feed.set_price(200);
+        assert_eq!(count_a.load(Ordering::Relaxed), 1); // unchanged
+        assert_eq!(count_b.load(Ordering::Relaxed), 2); // still active
+    }
+
+    #[test]
+    fn test_wire_feed_unsubscribe_disconnects() {
+        let feed = MockPriceFeed::new();
+        let calc = Arc::new(MarkPriceCalculator::with_default_config());
+
+        let sub_id = wire_feed_to_calculator(&feed, Arc::clone(&calc));
+
+        feed.set_price(50000);
+        assert_eq!(calc.index_price(), 50000);
+
+        // Disconnect wiring
+        assert!(feed.unsubscribe(sub_id));
+
+        // Further updates should NOT propagate
+        feed.set_price(99999);
+        assert_eq!(calc.index_price(), 50000); // unchanged
+    }
+
+    #[test]
+    fn test_static_feed_unsubscribe_returns_false() {
+        let feed = StaticPriceFeed::new(100, "static");
+        let id = feed.subscribe(Arc::new(|_: &PriceUpdate| {}));
+        assert!(!feed.unsubscribe(id));
+    }
+
+    #[test]
+    fn test_subscription_id_equality() {
+        let a = SubscriptionId(1);
+        let b = SubscriptionId(1);
+        let c = SubscriptionId(2);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     // ── nanos_since_epoch ────────────────────────────────────────────────
