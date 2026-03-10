@@ -9,7 +9,7 @@ use super::expiration::{
 };
 use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
 use super::fees::SharedFeeSchedule;
-use super::index_price_feed::{IndexPriceFeed, PriceUpdateListener};
+use super::index_price_feed::IndexPriceFeed;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
 use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
@@ -56,9 +56,6 @@ pub struct UnderlyingOrderBook {
     expiry_cycle_config: SharedExpiryCycleConfig,
     /// External index price feed for mark price computation.
     index_feed: Mutex<Option<Arc<dyn IndexPriceFeed>>>,
-    /// Listener handle kept alive so the subscription remains active.
-    #[allow(dead_code)]
-    index_feed_listener: Mutex<Option<PriceUpdateListener>>,
 }
 
 /// Underlying-level mass cancel summary.
@@ -183,7 +180,6 @@ impl UnderlyingOrderBook {
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
             index_feed: Mutex::new(None),
-            index_feed_listener: Mutex::new(None),
         }
     }
 
@@ -215,7 +211,6 @@ impl UnderlyingOrderBook {
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
             index_feed: Mutex::new(None),
-            index_feed_listener: Mutex::new(None),
         }
     }
 
@@ -248,7 +243,6 @@ impl UnderlyingOrderBook {
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
             index_feed: Mutex::new(None),
-            index_feed_listener: Mutex::new(None),
         }
     }
 
@@ -511,15 +505,17 @@ impl UnderlyingOrderBook {
     /// assert!(book.index_feed().is_some());
     /// ```
     pub fn set_index_feed(&self, feed: Arc<dyn IndexPriceFeed>) {
-        if let Ok(mut guard) = self.index_feed.lock() {
-            *guard = Some(feed);
-        }
+        let mut guard = self.index_feed.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(feed);
     }
 
     /// Returns the currently attached index price feed, if any.
     #[must_use]
     pub fn index_feed(&self) -> Option<Arc<dyn IndexPriceFeed>> {
-        self.index_feed.lock().ok().and_then(|guard| guard.clone())
+        self.index_feed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.

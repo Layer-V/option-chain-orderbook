@@ -69,6 +69,13 @@ pub struct PriceUpdate {
 ///
 /// Receives a shared reference to the [`PriceUpdate`] to avoid cloning
 /// when multiple listeners are registered.
+///
+/// # Panics
+///
+/// Listener implementations **must not panic**. If a listener panics during
+/// notification, subsequent listeners in the subscription list will not be
+/// called. Callers are responsible for ensuring their callbacks are
+/// panic-free.
 pub type PriceUpdateListener = Arc<dyn Fn(&PriceUpdate) + Send + Sync>;
 
 /// Trait for external index price sources.
@@ -169,13 +176,16 @@ impl MockPriceFeed {
             source: "mock".to_string(),
         };
 
-        // Notify all listeners while holding the lock briefly.
-        // The lock only protects the listener list iteration, not
-        // the listener execution (listeners run synchronously).
-        if let Ok(listeners) = self.listeners.lock() {
-            for listener in listeners.iter() {
-                listener(&update);
-            }
+        // Clone the listener list while holding the lock, then drop
+        // the lock before invoking callbacks. This prevents deadlocks
+        // if a listener calls back into the feed (e.g., subscribe).
+        let listeners = match self.listeners.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        for listener in listeners.iter() {
+            listener(&update);
         }
     }
 }
@@ -209,8 +219,9 @@ impl IndexPriceFeed for MockPriceFeed {
     }
 
     fn subscribe(&self, listener: PriceUpdateListener) {
-        if let Ok(mut listeners) = self.listeners.lock() {
-            listeners.push(listener);
+        match self.listeners.lock() {
+            Ok(mut listeners) => listeners.push(listener),
+            Err(poisoned) => poisoned.into_inner().push(listener),
         }
     }
 
@@ -245,8 +256,6 @@ pub struct StaticPriceFeed {
     source: String,
     /// Timestamp recorded at construction time in nanoseconds.
     timestamp_ns: u64,
-    /// Listeners accepted but never called.
-    _listeners: Mutex<Vec<PriceUpdateListener>>,
 }
 
 impl StaticPriceFeed {
@@ -262,7 +271,6 @@ impl StaticPriceFeed {
             price,
             source: source.into(),
             timestamp_ns: nanos_since_epoch(),
-            _listeners: Mutex::new(Vec::new()),
         }
     }
 }
@@ -288,12 +296,10 @@ impl IndexPriceFeed for StaticPriceFeed {
         })
     }
 
-    fn subscribe(&self, listener: PriceUpdateListener) {
-        // Accept the listener to satisfy the trait contract, but never call it
-        // since the price is immutable.
-        if let Ok(mut listeners) = self._listeners.lock() {
-            listeners.push(listener);
-        }
+    fn subscribe(&self, _listener: PriceUpdateListener) {
+        // StaticPriceFeed never changes its price and never notifies listeners.
+        // Accept the listener to satisfy the trait contract, then drop it to
+        // avoid unbounded growth of an unused listener list.
     }
 
     fn source(&self) -> &str {
