@@ -26,9 +26,7 @@ use crate::error::Error;
 use crate::orderbook::book::TerminalOrderSummary;
 use crate::orderbook::underlying::UnderlyingOrderBook;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::prelude::{
-    Journal, SequencerCommand, SequencerEvent, SequencerResult, TradeResult,
-};
+use orderbook_rs::prelude::{Journal, SequencerCommand, SequencerEvent, SequencerResult};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
 use serde::{Deserialize, Serialize};
@@ -112,16 +110,6 @@ pub enum OptionChainResult {
     OrderCancelled {
         /// The identifier of the cancelled order.
         order_id: OrderId,
-    },
-    /// An order was successfully updated.
-    OrderUpdated {
-        /// The identifier of the updated order.
-        order_id: OrderId,
-    },
-    /// A trade was executed.
-    TradeExecuted {
-        /// The trade result containing match details.
-        trade_result: TradeResult,
     },
     /// A mass cancel operation was executed.
     MassCancelled {
@@ -218,7 +206,7 @@ impl OptionChainSequencer {
         }
     }
 
-    /// Returns the next sequence number without incrementing.
+    /// Returns the sequence number that will be assigned by the next call to `assign()`.
     #[must_use]
     #[inline]
     pub fn current_sequence(&self) -> u64 {
@@ -322,6 +310,7 @@ impl SequencedUnderlyingOrderBook {
     }
 
     /// Creates a new sequenced underlying order book with a journal.
+    #[must_use]
     pub fn with_journal(
         underlying: impl Into<String>,
         journal: Arc<dyn Journal<()> + Send + Sync>,
@@ -344,6 +333,7 @@ impl SequencedUnderlyingOrderBook {
     }
 
     /// Creates a sequenced wrapper with journal around an existing book.
+    #[must_use]
     pub fn from_underlying_with_journal(
         underlying: UnderlyingOrderBook,
         journal: Arc<dyn Journal<()> + Send + Sync>,
@@ -656,10 +646,128 @@ impl SequencedUnderlyingOrderBook {
                     }
                 }
             }
-            _ => {
-                return OptionChainResult::Rejected {
-                    reason: "unsupported mass cancel scope".to_string(),
-                };
+            (MassCancelScope::Strike { expiration, strike }, MassCancelType::All) => {
+                match self.inner.get_expiration(expiration) {
+                    Ok(exp) => match exp.get_strike(*strike) {
+                        Ok(s) => {
+                            let call_count = s
+                                .call()
+                                .cancel_all()
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            let put_count = s
+                                .put()
+                                .cancel_all()
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            call_count.saturating_add(put_count)
+                        }
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Strike { expiration, strike }, MassCancelType::BySide(side)) => {
+                match self.inner.get_expiration(expiration) {
+                    Ok(exp) => match exp.get_strike(*strike) {
+                        Ok(s) => {
+                            let call_count = s
+                                .call()
+                                .cancel_by_side(*side)
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            let put_count = s
+                                .put()
+                                .cancel_by_side(*side)
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            call_count.saturating_add(put_count)
+                        }
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Strike { expiration, strike }, MassCancelType::ByUser(user_id)) => {
+                match self.inner.get_expiration(expiration) {
+                    Ok(exp) => match exp.get_strike(*strike) {
+                        Ok(s) => {
+                            let call_count = s
+                                .call()
+                                .cancel_by_user(*user_id)
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            let put_count = s
+                                .put()
+                                .cancel_by_user(*user_id)
+                                .map(|r| r.cancelled_count())
+                                .unwrap_or(0);
+                            call_count.saturating_add(put_count)
+                        }
+                        Err(e) => {
+                            return OptionChainResult::Rejected {
+                                reason: e.to_string(),
+                            };
+                        }
+                    },
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Book(symbol), MassCancelType::All) => {
+                match self.find_book_by_symbol(symbol) {
+                    Ok(book) => book.cancel_all().map(|r| r.cancelled_count()).unwrap_or(0),
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Book(symbol), MassCancelType::BySide(side)) => {
+                match self.find_book_by_symbol(symbol) {
+                    Ok(book) => book
+                        .cancel_by_side(*side)
+                        .map(|r| r.cancelled_count())
+                        .unwrap_or(0),
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
+            }
+            (MassCancelScope::Book(symbol), MassCancelType::ByUser(user_id)) => {
+                match self.find_book_by_symbol(symbol) {
+                    Ok(book) => book
+                        .cancel_by_user(*user_id)
+                        .map(|r| r.cancelled_count())
+                        .unwrap_or(0),
+                    Err(e) => {
+                        return OptionChainResult::Rejected {
+                            reason: e.to_string(),
+                        };
+                    }
+                }
             }
         };
 
@@ -712,24 +820,19 @@ impl SequencedUnderlyingOrderBook {
 
     /// Parses an expiration date string (YYYYMMDD format).
     fn parse_expiration(s: &str) -> Result<ExpirationDate, Error> {
-        use chrono::NaiveDate;
-        use optionstratlib::prelude::pos_or_panic;
+        use chrono::{NaiveDate, TimeZone, Utc};
 
         let date = NaiveDate::parse_from_str(s, "%Y%m%d")
             .map_err(|_| Error::invalid_symbol(s, "expected YYYYMMDD format"))?;
 
-        // Calculate days until expiration
-        let today = chrono::Utc::now().date_naive();
-        let days_until = (date - today).num_days();
+        // Construct a concrete expiration DateTime at midnight UTC on the given date,
+        // to match the representation used elsewhere in the codebase.
+        let naive_dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| Error::invalid_symbol(s, "invalid expiration date"))?;
+        let datetime_utc = Utc.from_utc_datetime(&naive_dt);
 
-        // Use at least 1 day for expired or same-day expirations
-        let days = if days_until <= 0 {
-            1.0
-        } else {
-            days_until as f64
-        };
-
-        Ok(ExpirationDate::Days(pos_or_panic!(days)))
+        Ok(ExpirationDate::DateTime(datetime_utc))
     }
 
     /// Persists an event to the journal.
