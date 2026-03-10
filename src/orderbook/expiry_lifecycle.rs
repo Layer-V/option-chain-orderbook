@@ -297,8 +297,8 @@ impl ExpiryLifecycleManager {
             // Allow catching up: if the scheduler missed ticks, we can jump
             // directly to the appropriate state based on `now`.
             if let Some(status) = current_status {
-                if now >= removal_dt && *status == InstrumentStatus::Expired {
-                    // Expired → Remove
+                if now >= removal_dt && *status >= InstrumentStatus::Expired {
+                    // Already Expired → Remove
                     to_remove.push(*expiration);
                     let event = LifecycleEvent::ExpirationRemoved {
                         underlying: underlying_name.clone(),
@@ -308,14 +308,52 @@ impl ExpiryLifecycleManager {
                         cb(&event);
                     }
                     result.events.push(event);
+                } else if now >= removal_dt && *status < InstrumentStatus::Expired {
+                    // Full catch-up: any pre-Expired state → cancel → Settling →
+                    // Expired → Remove, all in one pass.
+                    let exp_book = underlying.expirations().get(expiration)?;
+                    if *status < InstrumentStatus::Settling {
+                        set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
+                        let cancel_result = exp_book.cancel_all()?;
+                        let cancelled = cancel_result.total_cancelled();
+                        let settling_event = LifecycleEvent::InstrumentSettling {
+                            underlying: underlying_name.clone(),
+                            expiration: *expiration,
+                            cancelled_orders: cancelled,
+                        };
+                        if let Some(cb) = listener {
+                            cb(&settling_event);
+                        }
+                        result.events.push(settling_event);
+                    }
+                    set_all_book_status(exp_book.chain(), InstrumentStatus::Expired);
+                    let expired_event = LifecycleEvent::InstrumentExpired {
+                        underlying: underlying_name.clone(),
+                        expiration: *expiration,
+                    };
+                    if let Some(cb) = listener {
+                        cb(&expired_event);
+                    }
+                    result.events.push(expired_event);
+                    to_remove.push(*expiration);
+                    let removed_event = LifecycleEvent::ExpirationRemoved {
+                        underlying: underlying_name.clone(),
+                        expiration: *expiration,
+                    };
+                    if let Some(cb) = listener {
+                        cb(&removed_event);
+                    }
+                    result.events.push(removed_event);
                 } else if now >= settle_dt && *status < InstrumentStatus::Expired {
                     // Any state before Expired → Expired (catch up)
                     let exp_book = underlying.expirations().get(expiration)?;
-                    // If still Active/Halted/Pending, cancel orders first
+                    // If still Active/Halted/Pending, halt new orders first,
+                    // then cancel. This closes the window where new orders
+                    // could be accepted during cancellation.
                     if *status < InstrumentStatus::Settling {
+                        set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
                         let cancel_result = exp_book.cancel_all()?;
                         let cancelled = cancel_result.total_cancelled();
-                        // Emit settling event for the order cancellation
                         let settling_event = LifecycleEvent::InstrumentSettling {
                             underlying: underlying_name.clone(),
                             expiration: *expiration,
@@ -806,6 +844,61 @@ mod tests {
         assert_eq!(exp_book.total_order_count(), 0);
     }
 
+    // ── test_catchup_active_to_removal ─────────────────────────────────
+
+    #[test]
+    fn test_catchup_active_to_removal() {
+        // Tests that when check_expirations is first called after removal_dt,
+        // an Active chain catches up through Settling → Expired → Removed in one pass.
+        let exp = fixed_expiration(2026, 3, 10);
+        let underlying = setup_underlying_with_orders(exp);
+        let expiry_config = fixed_expiry_config();
+        let lifecycle_config = lifecycle_config_short(); // 1h retention
+
+        // Verify chain is Active with orders
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+        assert_eq!(
+            chain_status(exp_book.chain()),
+            Some(InstrumentStatus::Active)
+        );
+        assert!(exp_book.total_order_count() > 0);
+
+        // Time is well past settlement + retention (08:30 + 1h = 09:30)
+        let now = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 3, 10)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap(),
+        );
+
+        let result = ExpiryLifecycleManager::check_expirations(
+            &underlying,
+            now,
+            &expiry_config,
+            &lifecycle_config,
+            None,
+        )
+        .unwrap();
+
+        // Should have 3 events: Settling + Expired + Removed
+        assert_eq!(result.len(), 3);
+        assert!(matches!(
+            &result.events[0],
+            LifecycleEvent::InstrumentSettling { cancelled_orders, .. } if *cancelled_orders > 0
+        ));
+        assert!(matches!(
+            &result.events[1],
+            LifecycleEvent::InstrumentExpired { .. }
+        ));
+        assert!(matches!(
+            &result.events[2],
+            LifecycleEvent::ExpirationRemoved { .. }
+        ));
+
+        // Expiration was removed
+        assert!(underlying.expirations().get(&exp).is_err());
+    }
+
     // ── test_idempotent_settling ─────────────────────────────────────────
 
     #[test]
@@ -1078,8 +1171,13 @@ mod tests {
         )
         .unwrap();
 
-        // Should have 3 events: one per expiration
-        assert_eq!(result.len(), 3);
+        // 4 events total:
+        //   exp_expired (2025-12-15, Expired): already Expired → Removed  (1 event)
+        //   exp_settling (2026-03-15, Settling): past removal_dt → catch-up
+        //       Expired + Removed                                         (2 events)
+        //   exp_active (2026-06-15, Active): past expiry_dt but not
+        //       settle_dt → Settling                                      (1 event)
+        assert_eq!(result.len(), 4);
 
         let mut settling_count = 0;
         let mut expired_count = 0;
@@ -1093,10 +1191,11 @@ mod tests {
         }
         assert_eq!(settling_count, 1);
         assert_eq!(expired_count, 1);
-        assert_eq!(removed_count, 1);
+        assert_eq!(removed_count, 2);
 
-        // Verify: expired expiration (2025-12-15) was removed
+        // Verify: both expired and settling expirations were removed
         assert!(underlying.expirations().get(&exp_expired).is_err());
+        assert!(underlying.expirations().get(&exp_settling).is_err());
         // Active (2026-06-15) is now Settling
         let active = underlying.expirations().get(&exp_active).unwrap();
         assert_eq!(
@@ -1110,20 +1209,6 @@ mod tests {
                 .call()
                 .status(),
             InstrumentStatus::Settling
-        );
-        // Settling (2026-03-15) is now Expired
-        let settling = underlying.expirations().get(&exp_settling).unwrap();
-        assert_eq!(
-            settling
-                .chain()
-                .strikes()
-                .iter()
-                .next()
-                .unwrap()
-                .value()
-                .call()
-                .status(),
-            InstrumentStatus::Expired
         );
     }
 
