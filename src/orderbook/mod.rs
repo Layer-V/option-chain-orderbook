@@ -57,6 +57,7 @@ mod expiry_scheduler;
 mod fees;
 mod instrument_registry;
 mod instrument_status;
+mod mark_price;
 mod quote;
 mod stp;
 mod strike;
@@ -83,6 +84,7 @@ pub use expiry_lifecycle::{
 pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
+pub use mark_price::{MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder};
 pub use quote::{Quote, QuoteUpdate};
 pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
 pub use strike_generator::{CleanupResult, StrikeGenerator};
