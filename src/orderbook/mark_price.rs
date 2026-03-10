@@ -46,6 +46,8 @@
 //! ```
 
 use crate::error::{Error, Result};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -54,11 +56,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Defines the weights for each price source and the dampening factor that
 /// limits how much the mark price can change per update.
 ///
+/// All weight and dampening values are stored as [`Decimal`] for
+/// deterministic, architecture-independent arithmetic.
+///
 /// ## Validation
 ///
-/// - All weights must be in the range [0.0, 1.0]
-/// - Weights must sum to 1.0 (within a small internal tolerance)
-/// - Dampening factor must be in the range (0.0, 1.0]
+/// - All weights must be in the range \[0, 1\]
+/// - Weights must sum to exactly 1
+/// - Dampening factor must be in the range (0, 1\]
 ///
 /// ## Example
 ///
@@ -72,28 +77,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///     .build()
 ///     .expect("valid config");
 ///
-/// assert_eq!(config.index_weight(), 0.5);
+/// assert_eq!(config.index_weight(), rust_decimal::Decimal::new(5, 1));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkPriceConfig {
-    /// Weight for index price in range [0.0, 1.0].
-    index_weight: f64,
-    /// Weight for order book mid price in range [0.0, 1.0].
-    mid_weight: f64,
-    /// Weight for last trade price in range [0.0, 1.0].
-    last_trade_weight: f64,
-    /// Maximum price change per update as a fraction in range (0.0, 1.0].
+    /// Weight for index price in range \[0, 1\].
+    index_weight: Decimal,
+    /// Weight for order book mid price in range \[0, 1\].
+    mid_weight: Decimal,
+    /// Weight for last trade price in range \[0, 1\].
+    last_trade_weight: Decimal,
+    /// Maximum price change per update as a fraction in range (0, 1\].
     /// For example, 0.01 means mark price can move at most 1% per update.
-    dampening_factor: f64,
+    dampening_factor: Decimal,
 }
 
 impl Default for MarkPriceConfig {
     fn default() -> Self {
         Self {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 0.01,
+            index_weight: Decimal::new(5, 1),
+            mid_weight: Decimal::new(3, 1),
+            last_trade_weight: Decimal::new(2, 1),
+            dampening_factor: Decimal::new(1, 2),
         }
     }
 }
@@ -108,28 +113,28 @@ impl MarkPriceConfig {
     /// Returns the weight for index price.
     #[must_use]
     #[inline]
-    pub fn index_weight(&self) -> f64 {
+    pub fn index_weight(&self) -> Decimal {
         self.index_weight
     }
 
     /// Returns the weight for mid price.
     #[must_use]
     #[inline]
-    pub fn mid_weight(&self) -> f64 {
+    pub fn mid_weight(&self) -> Decimal {
         self.mid_weight
     }
 
     /// Returns the weight for last trade price.
     #[must_use]
     #[inline]
-    pub fn last_trade_weight(&self) -> f64 {
+    pub fn last_trade_weight(&self) -> Decimal {
         self.last_trade_weight
     }
 
     /// Returns the dampening factor.
     #[must_use]
     #[inline]
-    pub fn dampening_factor(&self) -> f64 {
+    pub fn dampening_factor(&self) -> Decimal {
         self.dampening_factor
     }
 
@@ -142,42 +147,48 @@ impl MarkPriceConfig {
     /// - Weights don't sum to approximately 1.0
     /// - Dampening factor is outside (0.0, 1.0]
     pub fn validate(&self) -> Result<()> {
-        // Check weight bounds (reject NaN/Infinity)
-        if !self.index_weight.is_finite() || !(0.0..=1.0).contains(&self.index_weight) {
+        // Check weight bounds
+        if self.index_weight < Decimal::ZERO || self.index_weight > Decimal::ONE {
             return Err(Error::configuration(format!(
-                "index_weight must be a finite value in [0.0, 1.0], got {}",
+                "index_weight must be in [0, 1], got {}",
                 self.index_weight
             )));
         }
-        if !self.mid_weight.is_finite() || !(0.0..=1.0).contains(&self.mid_weight) {
+        if self.mid_weight < Decimal::ZERO || self.mid_weight > Decimal::ONE {
             return Err(Error::configuration(format!(
-                "mid_weight must be a finite value in [0.0, 1.0], got {}",
+                "mid_weight must be in [0, 1], got {}",
                 self.mid_weight
             )));
         }
-        if !self.last_trade_weight.is_finite() || !(0.0..=1.0).contains(&self.last_trade_weight) {
+        if self.last_trade_weight < Decimal::ZERO || self.last_trade_weight > Decimal::ONE {
             return Err(Error::configuration(format!(
-                "last_trade_weight must be a finite value in [0.0, 1.0], got {}",
+                "last_trade_weight must be in [0, 1], got {}",
                 self.last_trade_weight
             )));
         }
 
-        // Check weights sum to 1.0 (with tolerance for floating point)
-        let sum = self.index_weight + self.mid_weight + self.last_trade_weight;
-        if (sum - 1.0).abs() > 0.001 {
-            return Err(Error::configuration(format!(
-                "weights must sum to 1.0, got {}",
-                sum
-            )));
+        // Check weights sum to exactly 1 (Decimal has no floating-point drift)
+        let sum = self
+            .index_weight
+            .checked_add(self.mid_weight)
+            .and_then(|s| s.checked_add(self.last_trade_weight));
+        match sum {
+            Some(s) if s == Decimal::ONE => {}
+            Some(s) => {
+                return Err(Error::configuration(format!(
+                    "weights must sum to 1, got {}",
+                    s
+                )));
+            }
+            None => {
+                return Err(Error::configuration("overflow computing weight sum"));
+            }
         }
 
-        // Check dampening factor (reject NaN/Infinity)
-        if !self.dampening_factor.is_finite()
-            || self.dampening_factor <= 0.0
-            || self.dampening_factor > 1.0
-        {
+        // Check dampening factor
+        if self.dampening_factor <= Decimal::ZERO || self.dampening_factor > Decimal::ONE {
             return Err(Error::configuration(format!(
-                "dampening_factor must be a finite value in (0.0, 1.0], got {}",
+                "dampening_factor must be in (0, 1], got {}",
                 self.dampening_factor
             )));
         }
@@ -206,10 +217,10 @@ impl MarkPriceConfig {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct MarkPriceConfigBuilder {
-    index_weight: Option<f64>,
-    mid_weight: Option<f64>,
-    last_trade_weight: Option<f64>,
-    dampening_factor: Option<f64>,
+    index_weight: Option<Decimal>,
+    mid_weight: Option<Decimal>,
+    last_trade_weight: Option<Decimal>,
+    dampening_factor: Option<Decimal>,
 }
 
 impl MarkPriceConfigBuilder {
@@ -221,45 +232,57 @@ impl MarkPriceConfigBuilder {
 
     /// Sets the weight for index price.
     ///
+    /// Accepts `f64` for ergonomic construction; the value is converted to
+    /// [`Decimal`] internally for deterministic arithmetic.
+    ///
     /// # Arguments
     ///
-    /// * `weight` - Weight in range [0.0, 1.0]
+    /// * `weight` - Weight in range \[0.0, 1.0\]
     #[must_use]
     pub fn index_weight(mut self, weight: f64) -> Self {
-        self.index_weight = Some(weight);
+        self.index_weight = Decimal::try_from(weight).ok();
         self
     }
 
     /// Sets the weight for mid price.
     ///
+    /// Accepts `f64` for ergonomic construction; the value is converted to
+    /// [`Decimal`] internally for deterministic arithmetic.
+    ///
     /// # Arguments
     ///
-    /// * `weight` - Weight in range [0.0, 1.0]
+    /// * `weight` - Weight in range \[0.0, 1.0\]
     #[must_use]
     pub fn mid_weight(mut self, weight: f64) -> Self {
-        self.mid_weight = Some(weight);
+        self.mid_weight = Decimal::try_from(weight).ok();
         self
     }
 
     /// Sets the weight for last trade price.
     ///
+    /// Accepts `f64` for ergonomic construction; the value is converted to
+    /// [`Decimal`] internally for deterministic arithmetic.
+    ///
     /// # Arguments
     ///
-    /// * `weight` - Weight in range [0.0, 1.0]
+    /// * `weight` - Weight in range \[0.0, 1.0\]
     #[must_use]
     pub fn last_trade_weight(mut self, weight: f64) -> Self {
-        self.last_trade_weight = Some(weight);
+        self.last_trade_weight = Decimal::try_from(weight).ok();
         self
     }
 
     /// Sets the dampening factor.
+    ///
+    /// Accepts `f64` for ergonomic construction; the value is converted to
+    /// [`Decimal`] internally for deterministic arithmetic.
     ///
     /// # Arguments
     ///
     /// * `factor` - Maximum price change per update as a fraction (e.g., 0.01 = 1%)
     #[must_use]
     pub fn dampening_factor(mut self, factor: f64) -> Self {
-        self.dampening_factor = Some(factor);
+        self.dampening_factor = Decimal::try_from(factor).ok();
         self
     }
 
@@ -457,26 +480,34 @@ impl MarkPriceCalculator {
             return None;
         }
 
-        // Compute weighted sum, only including non-zero prices
-        let mut weighted_sum: f64 = 0.0;
-        let mut total_weight: f64 = 0.0;
+        // Compute weighted sum using Decimal for deterministic arithmetic,
+        // only including non-zero prices.
+        let mut weighted_sum = Decimal::ZERO;
+        let mut total_weight = Decimal::ZERO;
 
         if index > 0 {
-            weighted_sum += index as f64 * self.config.index_weight;
-            total_weight += self.config.index_weight;
+            weighted_sum = weighted_sum
+                .saturating_add(Decimal::from(index).saturating_mul(self.config.index_weight));
+            total_weight = total_weight.saturating_add(self.config.index_weight);
         }
         if mid > 0 {
-            weighted_sum += mid as f64 * self.config.mid_weight;
-            total_weight += self.config.mid_weight;
+            weighted_sum = weighted_sum
+                .saturating_add(Decimal::from(mid).saturating_mul(self.config.mid_weight));
+            total_weight = total_weight.saturating_add(self.config.mid_weight);
         }
         if last_trade > 0 {
-            weighted_sum += last_trade as f64 * self.config.last_trade_weight;
-            total_weight += self.config.last_trade_weight;
+            weighted_sum = weighted_sum.saturating_add(
+                Decimal::from(last_trade).saturating_mul(self.config.last_trade_weight),
+            );
+            total_weight = total_weight.saturating_add(self.config.last_trade_weight);
         }
 
         // Normalize if not all inputs are present
-        let raw_mark = if total_weight > 0.0 {
-            (weighted_sum / total_weight) as u64
+        let raw_mark = if total_weight > Decimal::ZERO {
+            let avg = weighted_sum
+                .checked_div(total_weight)
+                .unwrap_or(Decimal::ZERO);
+            avg.to_u64().unwrap_or(0)
         } else {
             return None;
         };
@@ -486,8 +517,10 @@ impl MarkPriceCalculator {
         let mut prev_mark = self.last_mark_price.load(Ordering::Acquire);
         loop {
             let final_mark = if prev_mark > 0 {
-                let base_change = prev_mark as f64 * self.config.dampening_factor;
-                let mut max_change = base_change.ceil() as u64;
+                let base_change =
+                    Decimal::from(prev_mark).saturating_mul(self.config.dampening_factor);
+                let ceil_change = base_change.ceil();
+                let mut max_change = ceil_change.to_u64().unwrap_or(0);
                 if max_change == 0 && raw_mark != prev_mark {
                     max_change = 1;
                 }
@@ -550,25 +583,26 @@ impl std::fmt::Debug for MarkPriceCalculator {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     // ── MarkPriceConfig Tests ────────────────────────────────────────────
 
     #[test]
     fn test_default_config() {
         let config = MarkPriceConfig::default();
-        assert!((config.index_weight() - 0.5).abs() < f64::EPSILON);
-        assert!((config.mid_weight() - 0.3).abs() < f64::EPSILON);
-        assert!((config.last_trade_weight() - 0.2).abs() < f64::EPSILON);
-        assert!((config.dampening_factor() - 0.01).abs() < f64::EPSILON);
+        assert_eq!(config.index_weight(), dec!(0.5));
+        assert_eq!(config.mid_weight(), dec!(0.3));
+        assert_eq!(config.last_trade_weight(), dec!(0.2));
+        assert_eq!(config.dampening_factor(), dec!(0.01));
     }
 
     #[test]
     fn test_config_validation_valid() {
         let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 0.01,
+            index_weight: dec!(0.5),
+            mid_weight: dec!(0.3),
+            last_trade_weight: dec!(0.2),
+            dampening_factor: dec!(0.01),
         };
         assert!(config.validate().is_ok());
     }
@@ -576,10 +610,10 @@ mod tests {
     #[test]
     fn test_config_validation_weights_dont_sum_to_one() {
         let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.3, // Sum = 1.1
-            dampening_factor: 0.01,
+            index_weight: dec!(0.5),
+            mid_weight: dec!(0.3),
+            last_trade_weight: dec!(0.3), // Sum = 1.1
+            dampening_factor: dec!(0.01),
         };
         assert!(config.validate().is_err());
     }
@@ -587,10 +621,10 @@ mod tests {
     #[test]
     fn test_config_validation_weight_out_of_range() {
         let config = MarkPriceConfig {
-            index_weight: 1.5, // > 1.0
-            mid_weight: 0.0,
-            last_trade_weight: -0.5, // < 0.0
-            dampening_factor: 0.01,
+            index_weight: dec!(1.5), // > 1
+            mid_weight: dec!(0.0),
+            last_trade_weight: dec!(-0.5), // < 0
+            dampening_factor: dec!(0.01),
         };
         assert!(config.validate().is_err());
     }
@@ -598,10 +632,10 @@ mod tests {
     #[test]
     fn test_config_validation_dampening_zero() {
         let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 0.0, // Invalid
+            index_weight: dec!(0.5),
+            mid_weight: dec!(0.3),
+            last_trade_weight: dec!(0.2),
+            dampening_factor: dec!(0.0), // Invalid
         };
         assert!(config.validate().is_err());
     }
@@ -609,54 +643,21 @@ mod tests {
     #[test]
     fn test_config_validation_dampening_greater_than_one() {
         let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 1.5, // Invalid
+            index_weight: dec!(0.5),
+            mid_weight: dec!(0.3),
+            last_trade_weight: dec!(0.2),
+            dampening_factor: dec!(1.5), // Invalid
         };
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn test_config_validation_nan_dampening() {
+    fn test_config_validation_negative_dampening() {
         let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: f64::NAN,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validation_nan_weight() {
-        let config = MarkPriceConfig {
-            index_weight: f64::NAN,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 0.01,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validation_infinity_weight() {
-        let config = MarkPriceConfig {
-            index_weight: f64::INFINITY,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: 0.01,
-        };
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn test_config_validation_infinity_dampening() {
-        let config = MarkPriceConfig {
-            index_weight: 0.5,
-            mid_weight: 0.3,
-            last_trade_weight: 0.2,
-            dampening_factor: f64::INFINITY,
+            index_weight: dec!(0.5),
+            mid_weight: dec!(0.3),
+            last_trade_weight: dec!(0.2),
+            dampening_factor: dec!(-0.01),
         };
         assert!(config.validate().is_err());
     }
@@ -666,8 +667,8 @@ mod tests {
         let config = MarkPriceConfig::default();
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: MarkPriceConfig = serde_json::from_str(&json).unwrap();
-        assert!((deserialized.index_weight() - config.index_weight()).abs() < f64::EPSILON);
-        assert!((deserialized.mid_weight() - config.mid_weight()).abs() < f64::EPSILON);
+        assert_eq!(deserialized.index_weight(), config.index_weight());
+        assert_eq!(deserialized.mid_weight(), config.mid_weight());
     }
 
     // ── MarkPriceConfigBuilder Tests ─────────────────────────────────────
@@ -675,9 +676,9 @@ mod tests {
     #[test]
     fn test_builder_default_values() {
         let config = MarkPriceConfig::builder().build().unwrap();
-        assert!((config.index_weight() - 0.5).abs() < f64::EPSILON);
-        assert!((config.mid_weight() - 0.3).abs() < f64::EPSILON);
-        assert!((config.last_trade_weight() - 0.2).abs() < f64::EPSILON);
+        assert_eq!(config.index_weight(), dec!(0.5));
+        assert_eq!(config.mid_weight(), dec!(0.3));
+        assert_eq!(config.last_trade_weight(), dec!(0.2));
     }
 
     #[test]
@@ -690,10 +691,10 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!((config.index_weight() - 0.6).abs() < f64::EPSILON);
-        assert!((config.mid_weight() - 0.25).abs() < f64::EPSILON);
-        assert!((config.last_trade_weight() - 0.15).abs() < f64::EPSILON);
-        assert!((config.dampening_factor() - 0.02).abs() < f64::EPSILON);
+        assert_eq!(config.index_weight(), dec!(0.6));
+        assert_eq!(config.mid_weight(), dec!(0.25));
+        assert_eq!(config.last_trade_weight(), dec!(0.15));
+        assert_eq!(config.dampening_factor(), dec!(0.02));
     }
 
     #[test]
@@ -917,12 +918,15 @@ mod tests {
 
     #[test]
     fn test_equal_weights() {
-        let config = MarkPriceConfig::builder()
-            .index_weight(1.0 / 3.0)
-            .mid_weight(1.0 / 3.0)
-            .last_trade_weight(1.0 / 3.0)
-            .build()
-            .unwrap();
+        // Use exact Decimal values that sum to 1:
+        // 0.34 + 0.33 + 0.33 = 1.00
+        let config = MarkPriceConfig {
+            index_weight: dec!(0.34),
+            mid_weight: dec!(0.33),
+            last_trade_weight: dec!(0.33),
+            dampening_factor: dec!(0.01),
+        };
+        assert!(config.validate().is_ok());
         let calc = MarkPriceCalculator::new(config);
 
         calc.update_index_price(100);
@@ -930,8 +934,8 @@ mod tests {
         calc.update_last_trade_price(300);
 
         let mark = calc.mark_price().unwrap();
-        // Expected: (100 + 200 + 300) / 3 = 200
-        assert_eq!(mark, 200);
+        // Expected: 100*0.34 + 200*0.33 + 300*0.33 = 34 + 66 + 99 = 199
+        assert_eq!(mark, 199);
     }
 
     #[test]
