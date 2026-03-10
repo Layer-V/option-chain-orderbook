@@ -53,6 +53,7 @@ use dashmap::DashMap;
 use optionstratlib::greeks::Greek;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Quantity-weighted sum of Greeks across multiple positions.
 ///
@@ -274,8 +275,9 @@ impl Position {
 /// assert_eq!(result.delta, Decimal::new(5, 0));
 /// ```
 pub struct GreeksAggregator {
-    /// Positions keyed by account identifier.
-    positions: DashMap<String, Vec<Position>>,
+    /// Positions keyed by account identifier, with inner `HashMap` keyed by
+    /// `instrument_symbol` for O(1) lookups.
+    positions: DashMap<String, HashMap<String, Position>>,
 }
 
 impl GreeksAggregator {
@@ -290,27 +292,26 @@ impl GreeksAggregator {
     /// Adds a position to the specified account.
     ///
     /// If the account does not exist, it is created. If a position with the
-    /// same `instrument_symbol` already exists for this account, the new
-    /// position is appended (duplicates are allowed; use
-    /// [`update_position_greeks`](Self::update_position_greeks) to modify an existing entry).
+    /// same `instrument_symbol` already exists for this account, it is
+    /// replaced. Use [`update_position_greeks`](Self::update_position_greeks)
+    /// to modify only the Greeks of an existing entry.
     ///
     /// # Arguments
     ///
     /// * `account` - Account identifier
     /// * `position` - The position to add
     pub fn add_position(&self, account: &str, position: Position) {
+        let key = position.instrument_symbol.clone();
         self.positions
             .entry(account.to_string())
             .or_default()
-            .push(position);
+            .insert(key, position);
     }
 
-    /// Removes the first position matching `instrument_symbol` from the account.
+    /// Removes the position matching `instrument_symbol` from the account.
     ///
     /// Returns the removed position if found, `None` otherwise.
-    ///
-    /// **Note**: This operation uses `swap_remove` internally, so the order of
-    /// remaining positions in the account is not preserved.
+    /// This is an O(1) operation.
     ///
     /// # Arguments
     ///
@@ -319,17 +320,14 @@ impl GreeksAggregator {
     #[must_use]
     pub fn remove_position(&self, account: &str, instrument_symbol: &str) -> Option<Position> {
         let mut entry = self.positions.get_mut(account)?;
-        let positions = entry.value_mut();
-        let idx = positions
-            .iter()
-            .position(|p| p.instrument_symbol == instrument_symbol)?;
-        Some(positions.swap_remove(idx))
+        entry.value_mut().remove(instrument_symbol)
     }
 
     /// Updates the Greeks for an existing position.
     ///
-    /// Finds the first position matching `instrument_symbol` in the account
+    /// Finds the position matching `instrument_symbol` in the account
     /// and replaces its Greeks. Returns `true` if updated, `false` if not found.
+    /// This is an O(1) operation.
     ///
     /// # Arguments
     ///
@@ -343,21 +341,20 @@ impl GreeksAggregator {
         instrument_symbol: &str,
         greeks: Greek,
     ) -> bool {
-        if let Some(mut entry) = self.positions.get_mut(account) {
-            for pos in entry.value_mut().iter_mut() {
-                if pos.instrument_symbol == instrument_symbol {
-                    pos.greeks = greeks;
-                    return true;
-                }
-            }
+        if let Some(mut entry) = self.positions.get_mut(account)
+            && let Some(pos) = entry.value_mut().get_mut(instrument_symbol)
+        {
+            pos.greeks = greeks;
+            return true;
         }
         false
     }
 
     /// Updates the quantity for an existing position.
     ///
-    /// Finds the first position matching `instrument_symbol` in the account
+    /// Finds the position matching `instrument_symbol` in the account
     /// and replaces its quantity. Returns `true` if updated, `false` if not found.
+    /// This is an O(1) operation.
     ///
     /// # Arguments
     ///
@@ -371,13 +368,11 @@ impl GreeksAggregator {
         instrument_symbol: &str,
         quantity: i64,
     ) -> bool {
-        if let Some(mut entry) = self.positions.get_mut(account) {
-            for pos in entry.value_mut().iter_mut() {
-                if pos.instrument_symbol == instrument_symbol {
-                    pos.quantity = quantity;
-                    return true;
-                }
-            }
+        if let Some(mut entry) = self.positions.get_mut(account)
+            && let Some(pos) = entry.value_mut().get_mut(instrument_symbol)
+        {
+            pos.quantity = quantity;
+            return true;
         }
         false
     }
@@ -393,7 +388,7 @@ impl GreeksAggregator {
     pub fn aggregate_by_account(&self, account: &str) -> AggregatedGreeks {
         let mut agg = AggregatedGreeks::default();
         if let Some(entry) = self.positions.get(account) {
-            for pos in entry.value().iter() {
+            for pos in entry.value().values() {
                 let qty = Decimal::from(pos.quantity);
                 agg.accumulate(&pos.greeks, qty);
             }
@@ -413,7 +408,7 @@ impl GreeksAggregator {
     pub fn aggregate_by_underlying(&self, underlying: &str) -> AggregatedGreeks {
         let mut agg = AggregatedGreeks::default();
         for entry in self.positions.iter() {
-            for pos in entry.value().iter() {
+            for pos in entry.value().values() {
                 if pos.underlying == underlying {
                     let qty = Decimal::from(pos.quantity);
                     agg.accumulate(&pos.greeks, qty);
@@ -430,7 +425,7 @@ impl GreeksAggregator {
     pub fn aggregate_all(&self) -> AggregatedGreeks {
         let mut agg = AggregatedGreeks::default();
         for entry in self.positions.iter() {
-            for pos in entry.value().iter() {
+            for pos in entry.value().values() {
                 let qty = Decimal::from(pos.quantity);
                 agg.accumulate(&pos.greeks, qty);
             }
@@ -449,7 +444,7 @@ impl GreeksAggregator {
     pub fn positions_for_account(&self, account: &str) -> Vec<Position> {
         self.positions
             .get(account)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().values().cloned().collect())
             .unwrap_or_default()
     }
 
