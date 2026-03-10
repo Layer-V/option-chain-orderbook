@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// ## Validation
 ///
 /// - All weights must be in the range [0.0, 1.0]
-/// - Weights must sum to 1.0 (will be normalized if close)
+/// - Weights must sum to 1.0 (within a small internal tolerance)
 /// - Dampening factor must be in the range (0.0, 1.0]
 ///
 /// ## Example
@@ -142,22 +142,22 @@ impl MarkPriceConfig {
     /// - Weights don't sum to approximately 1.0
     /// - Dampening factor is outside (0.0, 1.0]
     pub fn validate(&self) -> Result<()> {
-        // Check weight bounds
-        if !(0.0..=1.0).contains(&self.index_weight) {
+        // Check weight bounds (reject NaN/Infinity)
+        if !self.index_weight.is_finite() || !(0.0..=1.0).contains(&self.index_weight) {
             return Err(Error::configuration(format!(
-                "index_weight must be in [0.0, 1.0], got {}",
+                "index_weight must be a finite value in [0.0, 1.0], got {}",
                 self.index_weight
             )));
         }
-        if !(0.0..=1.0).contains(&self.mid_weight) {
+        if !self.mid_weight.is_finite() || !(0.0..=1.0).contains(&self.mid_weight) {
             return Err(Error::configuration(format!(
-                "mid_weight must be in [0.0, 1.0], got {}",
+                "mid_weight must be a finite value in [0.0, 1.0], got {}",
                 self.mid_weight
             )));
         }
-        if !(0.0..=1.0).contains(&self.last_trade_weight) {
+        if !self.last_trade_weight.is_finite() || !(0.0..=1.0).contains(&self.last_trade_weight) {
             return Err(Error::configuration(format!(
-                "last_trade_weight must be in [0.0, 1.0], got {}",
+                "last_trade_weight must be a finite value in [0.0, 1.0], got {}",
                 self.last_trade_weight
             )));
         }
@@ -171,10 +171,13 @@ impl MarkPriceConfig {
             )));
         }
 
-        // Check dampening factor
-        if self.dampening_factor <= 0.0 || self.dampening_factor > 1.0 {
+        // Check dampening factor (reject NaN/Infinity)
+        if !self.dampening_factor.is_finite()
+            || self.dampening_factor <= 0.0
+            || self.dampening_factor > 1.0
+        {
             return Err(Error::configuration(format!(
-                "dampening_factor must be in (0.0, 1.0], got {}",
+                "dampening_factor must be a finite value in (0.0, 1.0], got {}",
                 self.dampening_factor
             )));
         }
@@ -289,6 +292,21 @@ impl MarkPriceConfigBuilder {
 ///
 /// All price updates and reads use atomic operations, making this safe for
 /// concurrent access from multiple threads without external synchronization.
+/// The dampening logic uses a compare-and-swap loop to guarantee the
+/// dampening invariant holds even under concurrent `mark_price()` calls.
+///
+/// Note that the three input prices (index, mid, last trade) are loaded
+/// individually — they do not form an atomic snapshot. Under rapid concurrent
+/// updates a mark price computation may see a mix of old and new inputs.
+/// This is acceptable because mark price is recomputed frequently and the
+/// inputs converge quickly.
+///
+/// ## Precision
+///
+/// Prices are stored as `u64` and converted to `f64` for the weighted
+/// average calculation. Values above 2^53 (≈ 9 × 10^15) may lose
+/// integer precision through the `f64` round-trip. For typical financial
+/// prices in smallest units (satoshis, wei, cents) this is not a concern.
 ///
 /// ## Example
 ///
@@ -423,10 +441,10 @@ impl MarkPriceCalculator {
     ///
     /// # Algorithm
     ///
-    /// 1. Load all input prices atomically
+    /// 1. Load all input prices (individually atomic, not a consistent snapshot)
     /// 2. Compute weighted average, using only non-zero inputs
     /// 3. Re-normalize weights if some inputs are missing
-    /// 4. Apply dampening: clamp change to ±(prev × dampening_factor)
+    /// 4. Apply dampening via CAS loop: clamp change to ±ceil(prev × dampening_factor)
     /// 5. Store and return the new mark price
     #[must_use]
     pub fn mark_price(&self) -> Option<u64> {
@@ -463,22 +481,38 @@ impl MarkPriceCalculator {
             return None;
         };
 
-        // Apply dampening
-        let prev_mark = self.last_mark_price.load(Ordering::Acquire);
-        let final_mark = if prev_mark > 0 {
-            let max_change = (prev_mark as f64 * self.config.dampening_factor) as u64;
-            let min_price = prev_mark.saturating_sub(max_change);
-            let max_price = prev_mark.saturating_add(max_change);
-            raw_mark.clamp(min_price, max_price)
-        } else {
-            // First calculation, no dampening
-            raw_mark
-        };
+        // Apply dampening using a CAS loop so concurrent updates always
+        // respect the dampening invariant relative to the latest stored value.
+        let mut prev_mark = self.last_mark_price.load(Ordering::Acquire);
+        loop {
+            let final_mark = if prev_mark > 0 {
+                let base_change = prev_mark as f64 * self.config.dampening_factor;
+                let mut max_change = base_change.ceil() as u64;
+                if max_change == 0 && raw_mark != prev_mark {
+                    max_change = 1;
+                }
+                let min_price = prev_mark.saturating_sub(max_change);
+                let max_price = prev_mark.saturating_add(max_change);
+                raw_mark.clamp(min_price, max_price)
+            } else {
+                // First calculation, no dampening
+                raw_mark
+            };
 
-        // Store the new mark price
-        self.last_mark_price.store(final_mark, Ordering::Release);
-
-        Some(final_mark)
+            match self.last_mark_price.compare_exchange(
+                prev_mark,
+                final_mark,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(final_mark),
+                Err(actual_prev) => {
+                    // Another thread updated the mark price; retry with the
+                    // latest value so dampening is applied correctly.
+                    prev_mark = actual_prev;
+                }
+            }
+        }
     }
 
     /// Resets all prices to zero.
@@ -579,6 +613,50 @@ mod tests {
             mid_weight: 0.3,
             last_trade_weight: 0.2,
             dampening_factor: 1.5, // Invalid
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_nan_dampening() {
+        let config = MarkPriceConfig {
+            index_weight: 0.5,
+            mid_weight: 0.3,
+            last_trade_weight: 0.2,
+            dampening_factor: f64::NAN,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_nan_weight() {
+        let config = MarkPriceConfig {
+            index_weight: f64::NAN,
+            mid_weight: 0.3,
+            last_trade_weight: 0.2,
+            dampening_factor: 0.01,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_infinity_weight() {
+        let config = MarkPriceConfig {
+            index_weight: f64::INFINITY,
+            mid_weight: 0.3,
+            last_trade_weight: 0.2,
+            dampening_factor: 0.01,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_infinity_dampening() {
+        let config = MarkPriceConfig {
+            index_weight: 0.5,
+            mid_weight: 0.3,
+            last_trade_weight: 0.2,
+            dampening_factor: f64::INFINITY,
         };
         assert!(config.validate().is_err());
     }
@@ -753,6 +831,30 @@ mod tests {
         calc.update_index_price(500);
         let mark2 = calc.mark_price().unwrap();
         assert_eq!(mark2, 900);
+    }
+
+    #[test]
+    fn test_calculator_dampening_small_price() {
+        let config = MarkPriceConfig::builder()
+            .index_weight(1.0)
+            .mid_weight(0.0)
+            .last_trade_weight(0.0)
+            .dampening_factor(0.001) // 0.1% max change
+            .build()
+            .unwrap();
+        let calc = MarkPriceCalculator::new(config);
+
+        // First update: set initial mark to 5 (small price)
+        calc.update_index_price(5);
+        let mark1 = calc.mark_price().unwrap();
+        assert_eq!(mark1, 5);
+
+        // Second update: try to jump to 10
+        // Without ceil fix, max_change = (5 * 0.001) as u64 = 0, mark stuck at 5
+        // With ceil fix, max_change = ceil(0.005) = 1, so mark can move to 6
+        calc.update_index_price(10);
+        let mark2 = calc.mark_price().unwrap();
+        assert_eq!(mark2, 6);
     }
 
     #[test]
