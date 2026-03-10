@@ -70,6 +70,9 @@ pub mod symbol_index;
 mod underlying;
 mod validation;
 
+#[cfg(feature = "nats")]
+pub mod nats;
+
 // Re-export all public types
 pub use book::{OptionOrderBook, TerminalOrderSummary};
 pub use chain::{
@@ -107,6 +110,11 @@ pub use underlying::{
     UnderlyingOrderBookManager, UnderlyingStats,
 };
 pub use validation::ValidationConfig;
+
+#[cfg(feature = "nats")]
+pub use book::NatsPublisherHandles;
+#[cfg(feature = "nats")]
+pub use nats::{OptionChainNatsConfig, OptionChainSubjectBuilder};
 
 // Re-export upstream types used in the public API
 pub use orderbook_rs::{
