@@ -221,11 +221,13 @@ pub mod utils;
 
 pub use error::{Error, Result};
 pub use orderbook::{
-    CleanupResult, CycleRule, ExpirationCallback, ExpiryCycleConfig, ExpiryLifecycleManager,
-    ExpiryScheduler, ExpiryType, IndexPriceFeed, LifecycleConfig, LifecycleEvent,
-    LifecycleListener, LifecycleResult, MarkPriceCalculator, MarkPriceConfig,
-    MarkPriceConfigBuilder, MockPriceFeed, PriceUpdate, PriceUpdateListener, RefreshResult,
-    StaticPriceFeed, StrikeGenerator, StrikeRangeConfig, StrikeRangeConfigBuilder, SymbolIndex,
-    SymbolRef, wire_feed_to_calculator,
+    AggregatedGreeks, CleanupResult, CycleRule, ExpirationCallback, ExpiryCycleConfig,
+    ExpiryLifecycleManager, ExpiryScheduler, ExpiryType, FlatVolSurface, GreeksAggregator,
+    GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener, IndexPriceFeed,
+    LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult, MarkPriceCalculator,
+    MarkPriceConfig, MarkPriceConfigBuilder, MockPriceFeed, Position, PriceUpdate,
+    PriceUpdateListener, RefreshResult, StaticPriceFeed, StrikeGenerator, StrikeRangeConfig,
+    StrikeRangeConfigBuilder, SymbolIndex, SymbolRef, VolSurface, calculate_tte_years,
+    wire_feed_to_calculator,
 };
 pub use utils::{ParsedSymbol, SymbolParser};
