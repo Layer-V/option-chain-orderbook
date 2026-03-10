@@ -176,6 +176,13 @@ pub enum Error {
         /// The symbol that was not found.
         symbol: String,
     },
+
+    /// Error when a journal operation fails.
+    #[error("journal error: {message}")]
+    JournalError {
+        /// Description of the journal error.
+        message: String,
+    },
 }
 
 impl Error {
@@ -343,6 +350,14 @@ impl Error {
     pub fn symbol_not_found(symbol: impl Into<String>) -> Self {
         Self::SymbolNotFound {
             symbol: symbol.into(),
+        }
+    }
+
+    /// Creates a new journal error.
+    #[must_use]
+    pub fn journal_error(message: impl Into<String>) -> Self {
+        Self::JournalError {
+            message: message.into(),
         }
     }
 }

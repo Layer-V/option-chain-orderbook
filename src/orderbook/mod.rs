@@ -73,6 +73,9 @@ mod validation;
 #[cfg(feature = "nats")]
 pub mod nats;
 
+#[cfg(feature = "sequencer")]
+pub mod sequencer;
+
 // Re-export all public types
 pub use book::{OptionOrderBook, TerminalOrderSummary};
 pub use chain::{
@@ -115,6 +118,12 @@ pub use validation::ValidationConfig;
 pub use book::NatsPublisherHandles;
 #[cfg(feature = "nats")]
 pub use nats::{OptionChainNatsConfig, OptionChainSubjectBuilder};
+
+#[cfg(feature = "sequencer")]
+pub use sequencer::{
+    MassCancelScope, MassCancelType, OptionChainCommand, OptionChainEvent, OptionChainReceipt,
+    OptionChainResult, SequencedUnderlyingOrderBook,
+};
 
 // Re-export upstream types used in the public API
 pub use orderbook_rs::{
