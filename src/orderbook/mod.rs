@@ -55,6 +55,7 @@ mod expiry_cycle;
 mod expiry_lifecycle;
 mod expiry_scheduler;
 mod fees;
+mod index_price_feed;
 mod instrument_registry;
 mod instrument_status;
 mod mark_price;
@@ -82,6 +83,10 @@ pub use expiry_lifecycle::{
     ExpiryLifecycleManager, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
 };
 pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
+pub use index_price_feed::{
+    IndexPriceFeed, MockPriceFeed, PriceUpdate, PriceUpdateListener, StaticPriceFeed,
+    wire_feed_to_calculator,
+};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
 pub use mark_price::{MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder};
