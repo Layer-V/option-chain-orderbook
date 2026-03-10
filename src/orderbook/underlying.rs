@@ -9,6 +9,7 @@ use super::expiration::{
 };
 use super::expiry_cycle::{ExpiryCycleConfig, SharedExpiryCycleConfig};
 use super::fees::SharedFeeSchedule;
+use super::index_price_feed::IndexPriceFeed;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::stp::SharedSTPMode;
 use super::strike_range::{ExpiryType, SharedStrikeRangeConfigs, StrikeRangeConfig};
@@ -20,7 +21,7 @@ use optionstratlib::ExpirationDate;
 use orderbook_rs::{FeeSchedule, OrderId, OrderStatus, STPMode, Side};
 use pricelevel::Hash32;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::book::TerminalOrderSummary;
@@ -53,6 +54,8 @@ pub struct UnderlyingOrderBook {
     strike_range_configs: SharedStrikeRangeConfigs,
     /// Expiry cycle configuration for automatic expiration date generation.
     expiry_cycle_config: SharedExpiryCycleConfig,
+    /// External index price feed for mark price computation.
+    index_feed: Mutex<Option<Arc<dyn IndexPriceFeed>>>,
 }
 
 /// Underlying-level mass cancel summary.
@@ -176,6 +179,7 @@ impl UnderlyingOrderBook {
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            index_feed: Mutex::new(None),
         }
     }
 
@@ -206,6 +210,7 @@ impl UnderlyingOrderBook {
             symbol_index: None,
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            index_feed: Mutex::new(None),
         }
     }
 
@@ -237,6 +242,7 @@ impl UnderlyingOrderBook {
             symbol_index: Some(symbol_index),
             strike_range_configs: SharedStrikeRangeConfigs::new(),
             expiry_cycle_config: SharedExpiryCycleConfig::new(),
+            index_feed: Mutex::new(None),
         }
     }
 
@@ -474,6 +480,42 @@ impl UnderlyingOrderBook {
     #[inline]
     pub fn clear_expiry_cycle_config(&self) {
         self.expiry_cycle_config.clear();
+    }
+
+    /// Sets the external index price feed for this underlying.
+    ///
+    /// The feed is stored and its latest price is available via
+    /// [`index_feed`](Self::index_feed). Replaces any previously set feed.
+    ///
+    /// # Arguments
+    ///
+    /// * `feed` - The index price feed to attach
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use option_chain_orderbook::orderbook::{
+    ///     UnderlyingOrderBook, MockPriceFeed, IndexPriceFeed,
+    /// };
+    ///
+    /// let book = UnderlyingOrderBook::new("BTC");
+    /// let feed: Arc<dyn IndexPriceFeed> = Arc::new(MockPriceFeed::new());
+    /// book.set_index_feed(Arc::clone(&feed));
+    /// assert!(book.index_feed().is_some());
+    /// ```
+    pub fn set_index_feed(&self, feed: Arc<dyn IndexPriceFeed>) {
+        let mut guard = self.index_feed.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(feed);
+    }
+
+    /// Returns the currently attached index price feed, if any.
+    #[must_use]
+    pub fn index_feed(&self) -> Option<Arc<dyn IndexPriceFeed>> {
+        self.index_feed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Gets or creates an expiration order book, returning an Arc reference.
