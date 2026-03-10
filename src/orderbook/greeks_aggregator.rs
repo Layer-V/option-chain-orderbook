@@ -91,6 +91,11 @@ pub struct AggregatedGreeks {
     pub color: Decimal,
     /// Number of positions aggregated.
     pub position_count: usize,
+    /// True if any arithmetic operation saturated to MAX/MIN during aggregation.
+    ///
+    /// When this flag is set, the aggregated values may be inaccurate and should
+    /// be treated as indicative only. Operators should investigate the cause.
+    pub saturated: bool,
 }
 
 impl AggregatedGreeks {
@@ -98,22 +103,48 @@ impl AggregatedGreeks {
     ///
     /// Each Greek field is multiplied by `quantity` and added with
     /// checked arithmetic. Overflows saturate to `Decimal::MAX` /
-    /// `Decimal::MIN` to avoid panics.
+    /// `Decimal::MIN` to avoid panics, and the `saturated` flag is set.
     #[inline]
     fn accumulate(&mut self, greeks: &Greek, quantity: Decimal) {
-        self.delta = checked_mul_add(self.delta, greeks.delta, quantity);
-        self.gamma = checked_mul_add(self.gamma, greeks.gamma, quantity);
-        self.theta = checked_mul_add(self.theta, greeks.theta, quantity);
-        self.vega = checked_mul_add(self.vega, greeks.vega, quantity);
-        self.rho = checked_mul_add(self.rho, greeks.rho, quantity);
-        self.rho_d = checked_mul_add(self.rho_d, greeks.rho_d, quantity);
-        self.alpha = checked_mul_add(self.alpha, greeks.alpha, quantity);
-        self.vanna = checked_mul_add(self.vanna, greeks.vanna, quantity);
-        self.vomma = checked_mul_add(self.vomma, greeks.vomma, quantity);
-        self.veta = checked_mul_add(self.veta, greeks.veta, quantity);
-        self.charm = checked_mul_add(self.charm, greeks.charm, quantity);
-        self.color = checked_mul_add(self.color, greeks.color, quantity);
+        let (delta, sat1) = checked_mul_add_with_flag(self.delta, greeks.delta, quantity);
+        let (gamma, sat2) = checked_mul_add_with_flag(self.gamma, greeks.gamma, quantity);
+        let (theta, sat3) = checked_mul_add_with_flag(self.theta, greeks.theta, quantity);
+        let (vega, sat4) = checked_mul_add_with_flag(self.vega, greeks.vega, quantity);
+        let (rho, sat5) = checked_mul_add_with_flag(self.rho, greeks.rho, quantity);
+        let (rho_d, sat6) = checked_mul_add_with_flag(self.rho_d, greeks.rho_d, quantity);
+        let (alpha, sat7) = checked_mul_add_with_flag(self.alpha, greeks.alpha, quantity);
+        let (vanna, sat8) = checked_mul_add_with_flag(self.vanna, greeks.vanna, quantity);
+        let (vomma, sat9) = checked_mul_add_with_flag(self.vomma, greeks.vomma, quantity);
+        let (veta, sat10) = checked_mul_add_with_flag(self.veta, greeks.veta, quantity);
+        let (charm, sat11) = checked_mul_add_with_flag(self.charm, greeks.charm, quantity);
+        let (color, sat12) = checked_mul_add_with_flag(self.color, greeks.color, quantity);
+
+        self.delta = delta;
+        self.gamma = gamma;
+        self.theta = theta;
+        self.vega = vega;
+        self.rho = rho;
+        self.rho_d = rho_d;
+        self.alpha = alpha;
+        self.vanna = vanna;
+        self.vomma = vomma;
+        self.veta = veta;
+        self.charm = charm;
+        self.color = color;
         self.position_count = self.position_count.saturating_add(1);
+        self.saturated = self.saturated
+            || sat1
+            || sat2
+            || sat3
+            || sat4
+            || sat5
+            || sat6
+            || sat7
+            || sat8
+            || sat9
+            || sat10
+            || sat11
+            || sat12;
     }
 }
 
@@ -126,6 +157,16 @@ impl AggregatedGreeks {
 ///
 /// The aggregator multiplies each Greek by the quantity, so shorts
 /// naturally produce negative contributions.
+///
+/// ## Quantity Bounds
+///
+/// The `quantity` field is `i64`, which is converted to `Decimal` during
+/// aggregation via `Decimal::from(i64)`. This conversion is safe for all
+/// `i64` values since `Decimal` can represent the full `i64` range without
+/// overflow. However, the subsequent multiplication with Greek values uses
+/// checked arithmetic and may saturate if the product exceeds `Decimal::MAX`.
+/// Callers should ensure quantities stay within reasonable trading bounds
+/// (e.g., ±1 billion contracts) to avoid saturation during aggregation.
 #[derive(Debug, Clone)]
 pub struct Position {
     /// Option symbol (e.g., `"BTC-20260130-50000-C"`).
@@ -447,24 +488,36 @@ impl std::fmt::Debug for GreeksAggregator {
 
 /// Computes `accumulator + (greek_value * quantity)` with checked arithmetic.
 ///
-/// Falls back to saturating addition if either the multiplication or addition
-/// overflows the [`Decimal`] range.
+/// Returns `(result, saturated)` where `saturated` is true if either the
+/// multiplication or addition overflowed and was capped to MAX/MIN.
 #[inline]
-fn checked_mul_add(accumulator: Decimal, greek_value: Decimal, quantity: Decimal) -> Decimal {
-    let product = greek_value.checked_mul(quantity).unwrap_or_else(|| {
-        if quantity.is_sign_positive() == greek_value.is_sign_positive() {
-            Decimal::MAX
-        } else {
-            Decimal::MIN
+fn checked_mul_add_with_flag(
+    accumulator: Decimal,
+    greek_value: Decimal,
+    quantity: Decimal,
+) -> (Decimal, bool) {
+    let (product, mul_saturated) = match greek_value.checked_mul(quantity) {
+        Some(p) => (p, false),
+        None => {
+            let sat = if quantity.is_sign_positive() == greek_value.is_sign_positive() {
+                Decimal::MAX
+            } else {
+                Decimal::MIN
+            };
+            (sat, true)
         }
-    });
-    accumulator.checked_add(product).unwrap_or_else(|| {
-        if product.is_sign_positive() {
-            Decimal::MAX
-        } else {
-            Decimal::MIN
+    };
+    match accumulator.checked_add(product) {
+        Some(r) => (r, mul_saturated),
+        None => {
+            let sat = if product.is_sign_positive() {
+                Decimal::MAX
+            } else {
+                Decimal::MIN
+            };
+            (sat, true)
         }
-    })
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -887,20 +940,24 @@ mod tests {
         assert_eq!(agg.account_count(), 4);
     }
 
-    // ── checked_mul_add ─────────────────────────────────────────────────
+    // ── checked_mul_add_with_flag ─────────────────────────────────────────
 
     #[test]
     fn test_checked_mul_add_normal() {
-        let result = checked_mul_add(Decimal::ONE, Decimal::TWO, Decimal::new(3, 0));
+        let (result, saturated) =
+            checked_mul_add_with_flag(Decimal::ONE, Decimal::TWO, Decimal::new(3, 0));
         // 1 + (2 * 3) = 7
         assert_eq!(result, Decimal::new(7, 0));
+        assert!(!saturated);
     }
 
     #[test]
     fn test_checked_mul_add_zero_quantity() {
-        let result = checked_mul_add(Decimal::new(5, 0), Decimal::new(100, 0), Decimal::ZERO);
+        let (result, saturated) =
+            checked_mul_add_with_flag(Decimal::new(5, 0), Decimal::new(100, 0), Decimal::ZERO);
         // 5 + (100 * 0) = 5
         assert_eq!(result, Decimal::new(5, 0));
+        assert!(!saturated);
     }
 
     #[test]
@@ -910,8 +967,9 @@ mod tests {
         let value = Decimal::MAX;
         let quantity = Decimal::TWO;
 
-        let result = checked_mul_add(acc, value, quantity);
+        let (result, saturated) = checked_mul_add_with_flag(acc, value, quantity);
         assert_eq!(result, Decimal::MAX);
+        assert!(saturated);
     }
 
     #[test]
@@ -921,7 +979,54 @@ mod tests {
         let value = Decimal::MIN;
         let quantity = Decimal::TWO;
 
-        let result = checked_mul_add(acc, value, quantity);
+        let (result, saturated) = checked_mul_add_with_flag(acc, value, quantity);
         assert_eq!(result, Decimal::MIN);
+        assert!(saturated);
+    }
+
+    // ── Saturation flag ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_aggregated_greeks_saturation_flag_set_on_overflow() {
+        let agg = GreeksAggregator::new();
+        // Create a position with extreme Greeks that will cause overflow
+        let extreme_greeks = Greek {
+            delta: Decimal::MAX,
+            gamma: Decimal::ZERO,
+            theta: Decimal::ZERO,
+            vega: Decimal::ZERO,
+            rho: Decimal::ZERO,
+            rho_d: Decimal::ZERO,
+            alpha: Decimal::ZERO,
+            vanna: Decimal::ZERO,
+            vomma: Decimal::ZERO,
+            veta: Decimal::ZERO,
+            charm: Decimal::ZERO,
+            color: Decimal::ZERO,
+        };
+        // Add two positions that will overflow delta when summed
+        agg.add_position("acc", Position::new("A", "BTC", 2, extreme_greeks.clone()));
+        agg.add_position("acc", Position::new("B", "BTC", 2, extreme_greeks));
+
+        let result = agg.aggregate_by_account("acc");
+        assert!(result.saturated, "Expected saturation flag to be set");
+        assert_eq!(result.delta, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_aggregated_greeks_no_saturation_for_normal_values() {
+        let agg = GreeksAggregator::new();
+        agg.add_position(
+            "acc",
+            Position::new("A", "BTC", 10, delta_only(Decimal::ONE)),
+        );
+        agg.add_position(
+            "acc",
+            Position::new("B", "BTC", 5, delta_only(Decimal::TWO)),
+        );
+
+        let result = agg.aggregate_by_account("acc");
+        assert!(!result.saturated, "Expected no saturation");
+        assert_eq!(result.delta, Decimal::new(20, 0)); // 10*1 + 5*2 = 20
     }
 }
