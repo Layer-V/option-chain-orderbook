@@ -144,6 +144,14 @@ impl ExpiryCycleConfig {
                 "settlement_time_utc ({sh}:{sm:02}) is not a valid 24-hour time"
             )));
         }
+        // Settlement must be at or after expiry on the same day
+        let expiry_mins = eh * 60 + em;
+        let settle_mins = sh * 60 + sm;
+        if settle_mins < expiry_mins {
+            return Err(Error::configuration(format!(
+                "settlement_time_utc ({sh}:{sm:02}) must be at or after expiry_time_utc ({eh}:{em:02})"
+            )));
+        }
         Ok(())
     }
 

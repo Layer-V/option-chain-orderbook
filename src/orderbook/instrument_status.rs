@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This enum is stored as an [`AtomicU8`](std::sync::atomic::AtomicU8) inside
 /// [`OptionOrderBook`](super::book::OptionOrderBook) for lock-free concurrent access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum InstrumentStatus {
     /// Instrument is pending activation (not yet trading).

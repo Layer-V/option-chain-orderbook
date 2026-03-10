@@ -294,6 +294,8 @@ impl ExpiryLifecycleManager {
                 .ok_or_else(|| Error::configuration("overflow computing removal datetime"))?;
 
             // Check transitions in reverse order (furthest-along state first).
+            // Allow catching up: if the scheduler missed ticks, we can jump
+            // directly to the appropriate state based on `now`.
             if let Some(status) = current_status {
                 if now >= removal_dt && *status == InstrumentStatus::Expired {
                     // Expired → Remove
@@ -306,9 +308,24 @@ impl ExpiryLifecycleManager {
                         cb(&event);
                     }
                     result.events.push(event);
-                } else if now >= settle_dt && *status == InstrumentStatus::Settling {
-                    // Settling → Expired
+                } else if now >= settle_dt && *status < InstrumentStatus::Expired {
+                    // Any state before Expired → Expired (catch up)
                     let exp_book = underlying.expirations().get(expiration)?;
+                    // If still Active/Halted/Pending, cancel orders first
+                    if *status < InstrumentStatus::Settling {
+                        let cancel_result = exp_book.cancel_all()?;
+                        let cancelled = cancel_result.total_cancelled();
+                        // Emit settling event for the order cancellation
+                        let settling_event = LifecycleEvent::InstrumentSettling {
+                            underlying: underlying_name.clone(),
+                            expiration: *expiration,
+                            cancelled_orders: cancelled,
+                        };
+                        if let Some(cb) = listener {
+                            cb(&settling_event);
+                        }
+                        result.events.push(settling_event);
+                    }
                     set_all_book_status(exp_book.chain(), InstrumentStatus::Expired);
                     let event = LifecycleEvent::InstrumentExpired {
                         underlying: underlying_name.clone(),
@@ -318,8 +335,8 @@ impl ExpiryLifecycleManager {
                         cb(&event);
                     }
                     result.events.push(event);
-                } else if now >= expiry_dt && *status == InstrumentStatus::Active {
-                    // Active → Settling
+                } else if now >= expiry_dt && *status < InstrumentStatus::Settling {
+                    // Active/Halted/Pending → Settling
                     let exp_book = underlying.expirations().get(expiration)?;
                     set_all_book_status(exp_book.chain(), InstrumentStatus::Settling);
                     let cancel_result = exp_book.cancel_all()?;
@@ -378,11 +395,21 @@ fn chain_status(chain: &super::chain::OptionChainOrderBook) -> Option<Instrument
 
 /// Sets the lifecycle status on all option books (call and put) across every
 /// strike in the chain.
+///
+/// This function only moves statuses *forward* in the lifecycle (based on the
+/// enum's ordering), so it will not downgrade a book that has already advanced
+/// further in another thread.
 fn set_all_book_status(chain: &super::chain::OptionChainOrderBook, status: InstrumentStatus) {
     for entry in chain.strikes().iter() {
         let strike = entry.value();
-        strike.call().set_status(status);
-        strike.put().set_status(status);
+        // Only advance the call book if we're moving forward in the lifecycle
+        if strike.call().status() < status {
+            strike.call().set_status(status);
+        }
+        // Only advance the put book if we're moving forward in the lifecycle
+        if strike.put().status() < status {
+            strike.put().set_status(status);
+        }
     }
 }
 
@@ -699,6 +726,65 @@ mod tests {
         // Orders still present
         let exp_book = underlying.expirations().get(&exp).unwrap();
         assert!(exp_book.total_order_count() > 0);
+    }
+
+    // ── test_catchup_active_to_expired ──────────────────────────────────
+
+    #[test]
+    fn test_catchup_active_to_expired() {
+        // Tests that when check_expirations is first called after settle_dt,
+        // an Active chain catches up directly to Expired (emitting both events).
+        let exp = fixed_expiration(2026, 3, 10);
+        let underlying = setup_underlying_with_orders(exp);
+        let expiry_config = fixed_expiry_config();
+        let lifecycle_config = lifecycle_config_short();
+
+        // Verify chain is Active
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+        assert_eq!(
+            chain_status(exp_book.chain()),
+            Some(InstrumentStatus::Active)
+        );
+        let initial_orders = exp_book.total_order_count();
+        assert!(initial_orders > 0);
+
+        // Time is after settlement (08:30) — we "missed" the 08:00 expiry tick
+        let now = Utc.from_utc_datetime(
+            &NaiveDate::from_ymd_opt(2026, 3, 10)
+                .unwrap()
+                .and_hms_opt(8, 45, 0)
+                .unwrap(),
+        );
+
+        let result = ExpiryLifecycleManager::check_expirations(
+            &underlying,
+            now,
+            &expiry_config,
+            &lifecycle_config,
+            None,
+        )
+        .unwrap();
+
+        // Should have 2 events: InstrumentSettling (for order cancellation) + InstrumentExpired
+        assert_eq!(result.len(), 2);
+        assert!(matches!(
+            &result.events[0],
+            LifecycleEvent::InstrumentSettling { cancelled_orders, .. } if *cancelled_orders > 0
+        ));
+        assert!(matches!(
+            &result.events[1],
+            LifecycleEvent::InstrumentExpired { .. }
+        ));
+
+        // Verify instruments are now Expired (skipped Settling)
+        let exp_book = underlying.expirations().get(&exp).unwrap();
+        for entry in exp_book.chain().strikes().iter() {
+            assert_eq!(entry.value().call().status(), InstrumentStatus::Expired);
+            assert_eq!(entry.value().put().status(), InstrumentStatus::Expired);
+        }
+
+        // Verify orders were cancelled
+        assert_eq!(exp_book.total_order_count(), 0);
     }
 
     // ── test_idempotent_settling ─────────────────────────────────────────
