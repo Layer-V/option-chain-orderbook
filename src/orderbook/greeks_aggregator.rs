@@ -251,7 +251,7 @@ impl GreeksAggregator {
     /// If the account does not exist, it is created. If a position with the
     /// same `instrument_symbol` already exists for this account, the new
     /// position is appended (duplicates are allowed; use
-    /// [`update_position`](Self::update_position) to modify an existing entry).
+    /// [`update_position_greeks`](Self::update_position_greeks) to modify an existing entry).
     ///
     /// # Arguments
     ///
@@ -266,7 +266,10 @@ impl GreeksAggregator {
 
     /// Removes the first position matching `instrument_symbol` from the account.
     ///
-    /// Returns the removed position, or `None` if not found.
+    /// Returns the removed position if found, `None` otherwise.
+    ///
+    /// **Note**: This operation uses `swap_remove` internally, so the order of
+    /// remaining positions in the account is not preserved.
     ///
     /// # Arguments
     ///
@@ -293,7 +296,12 @@ impl GreeksAggregator {
     /// * `instrument_symbol` - Symbol of the instrument to update
     /// * `greeks` - New Greeks values
     #[must_use]
-    pub fn update_position(&self, account: &str, instrument_symbol: &str, greeks: Greek) -> bool {
+    pub fn update_position_greeks(
+        &self,
+        account: &str,
+        instrument_symbol: &str,
+        greeks: Greek,
+    ) -> bool {
         if let Some(mut entry) = self.positions.get_mut(account) {
             for pos in entry.value_mut().iter_mut() {
                 if pos.instrument_symbol == instrument_symbol {
@@ -407,7 +415,10 @@ impl GreeksAggregator {
     /// Returns the number of accounts with at least one position.
     #[must_use]
     pub fn account_count(&self) -> usize {
-        self.positions.len()
+        self.positions
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .count()
     }
 
     /// Removes all positions from all accounts.
@@ -440,20 +451,20 @@ impl std::fmt::Debug for GreeksAggregator {
 /// overflows the [`Decimal`] range.
 #[inline]
 fn checked_mul_add(accumulator: Decimal, greek_value: Decimal, quantity: Decimal) -> Decimal {
-    let product = greek_value.checked_mul(quantity).unwrap_or(
+    let product = greek_value.checked_mul(quantity).unwrap_or_else(|| {
         if quantity.is_sign_positive() == greek_value.is_sign_positive() {
             Decimal::MAX
         } else {
             Decimal::MIN
-        },
-    );
-    accumulator
-        .checked_add(product)
-        .unwrap_or(if product.is_sign_positive() {
+        }
+    });
+    accumulator.checked_add(product).unwrap_or_else(|| {
+        if product.is_sign_positive() {
             Decimal::MAX
         } else {
             Decimal::MIN
-        })
+        }
+    })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -659,7 +670,7 @@ mod tests {
         );
 
         // Delta was 1.0, now update to 2.0
-        let updated = agg.update_position("acc1", "BTC-C", delta_only(Decimal::TWO));
+        let updated = agg.update_position_greeks("acc1", "BTC-C", delta_only(Decimal::TWO));
         assert!(updated);
 
         let result = agg.aggregate_by_account("acc1");
@@ -670,7 +681,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_position() {
         let agg = GreeksAggregator::new();
-        assert!(!agg.update_position("ghost", "BTC-C", delta_only(Decimal::ONE)));
+        assert!(!agg.update_position_greeks("ghost", "BTC-C", delta_only(Decimal::ONE)));
     }
 
     // ── Update position quantity ────────────────────────────────────────
@@ -890,5 +901,27 @@ mod tests {
         let result = checked_mul_add(Decimal::new(5, 0), Decimal::new(100, 0), Decimal::ZERO);
         // 5 + (100 * 0) = 5
         assert_eq!(result, Decimal::new(5, 0));
+    }
+
+    #[test]
+    fn test_checked_mul_add_overflow_saturates_to_max() {
+        // Force multiplication overflow: MAX * 2 should saturate.
+        let acc = Decimal::ZERO;
+        let value = Decimal::MAX;
+        let quantity = Decimal::TWO;
+
+        let result = checked_mul_add(acc, value, quantity);
+        assert_eq!(result, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_checked_mul_add_overflow_saturates_to_min() {
+        // Force addition overflow in the negative direction: MIN + (MIN * 2) should saturate.
+        let acc = Decimal::MIN;
+        let value = Decimal::MIN;
+        let quantity = Decimal::TWO;
+
+        let result = checked_mul_add(acc, value, quantity);
+        assert_eq!(result, Decimal::MIN);
     }
 }

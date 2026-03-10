@@ -76,16 +76,14 @@ pub fn greeks_aggregator_operations(c: &mut Criterion) {
 
     // Bench add_position
     group.bench_function("add_position", |b| {
-        let agg = GreeksAggregator::new();
         let greeks = sample_greek();
-        let mut i = 0u64;
         b.iter(|| {
-            let symbol = format!("INST-{}", i);
+            let agg = GreeksAggregator::new();
+            let symbol = String::from("INST-0");
             agg.add_position(
                 "bench-account",
                 Position::new(symbol, "BTC", 10, greeks.clone()),
             );
-            i = i.wrapping_add(1);
         });
     });
 
