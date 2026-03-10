@@ -121,8 +121,9 @@ pub use nats::{OptionChainNatsConfig, OptionChainSubjectBuilder};
 
 #[cfg(feature = "sequencer")]
 pub use sequencer::{
-    MassCancelScope, MassCancelType, OptionChainCommand, OptionChainEvent, OptionChainReceipt,
-    OptionChainResult, SequencedUnderlyingOrderBook,
+    InMemoryOptionChainJournal, MassCancelScope, MassCancelType, OptionChainCommand,
+    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult,
+    SequencedUnderlyingOrderBook,
 };
 
 // Re-export upstream types used in the public API
