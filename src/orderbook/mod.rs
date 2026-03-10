@@ -55,6 +55,7 @@ mod expiry_cycle;
 mod expiry_lifecycle;
 mod expiry_scheduler;
 mod fees;
+pub mod greeks_aggregator;
 mod index_price_feed;
 mod instrument_registry;
 mod instrument_status;
@@ -83,6 +84,7 @@ pub use expiry_lifecycle::{
     ExpiryLifecycleManager, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
 };
 pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
+pub use greeks_aggregator::{AggregatedGreeks, GreeksAggregator, Position};
 pub use index_price_feed::{
     IndexPriceFeed, MockPriceFeed, PriceUpdate, PriceUpdateListener, StaticPriceFeed,
     wire_feed_to_calculator,
