@@ -144,6 +144,14 @@ impl ExpiryCycleConfig {
                 "settlement_time_utc ({sh}:{sm:02}) is not a valid 24-hour time"
             )));
         }
+        // Settlement must be at or after expiry on the same day
+        let expiry_mins = eh * 60 + em;
+        let settle_mins = sh * 60 + sm;
+        if settle_mins < expiry_mins {
+            return Err(Error::configuration(format!(
+                "settlement_time_utc ({sh}:{sm:02}) must be at or after expiry_time_utc ({eh}:{em:02})"
+            )));
+        }
         Ok(())
     }
 
@@ -414,7 +422,7 @@ fn advance_quarter(year: i32, q_month: u32) -> Result<(i32, u32)> {
 }
 
 /// Converts a `NaiveDate` and time components to a `DateTime<Utc>`.
-fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
+pub(crate) fn to_datetime(date: NaiveDate, hour: u32, minute: u32) -> Result<DateTime<Utc>> {
     let naive_dt = date
         .and_hms_opt(hour, minute, 0)
         .ok_or_else(|| Error::configuration("invalid time in to_datetime"))?;
