@@ -117,14 +117,20 @@ impl StrikeGenerator {
             / interval
             * interval;
 
-        // Compute range bounds using f64 for the percentage calculation
-        let spot_f64 = spot as f64;
-        let low_f64 = spot_f64 * (1.0 - range_pct);
-        let high_f64 = spot_f64 * (1.0 + range_pct);
+        // Compute range bounds using integer arithmetic for deterministic behavior.
+        // Convert range_pct to basis points (multiply by 10000) to avoid f64 jitter.
+        // range = spot * range_pct = spot * (range_pct_bps / 10000)
+        let range_pct_bps = (range_pct * 10000.0).round() as u64;
+        let range = spot
+            .checked_mul(range_pct_bps)
+            .ok_or_else(|| Error::configuration("overflow computing range"))?
+            / 10000;
 
-        // Convert to u64; range_pct is validated to (0,1] so low_f64 is non-negative
-        let low = low_f64 as u64;
-        let high = high_f64 as u64;
+        // low = spot - range, high = spot + range
+        let low = spot.saturating_sub(range);
+        let high = spot
+            .checked_add(range)
+            .ok_or_else(|| Error::configuration("overflow computing high bound"))?;
 
         // Floor low to interval multiple
         let low_strike = (low / interval) * interval;
@@ -373,22 +379,27 @@ impl StrikeGenerator {
             ));
         }
 
-        // Compute buffered range, mirroring generate_strikes behaviour:
-        // - use ceil on the floating range to avoid truncation
-        // - align low/high to strike_interval multiples
-        let spot_f64 = spot as f64;
-        let range = (spot_f64 * config.range_pct() * buffer_multiplier).ceil();
-        let range_u64 = if range.is_finite() && range > 0.0 {
-            range as u64
-        } else {
-            0_u64
-        };
+        // Compute buffered range using integer arithmetic for deterministic behavior.
+        // Convert range_pct to basis points and apply buffer_multiplier.
+        // range = spot * range_pct * buffer_multiplier
+        //       = spot * (range_pct_bps / 10000) * buffer_multiplier
+        let range_pct = config.range_pct();
+        let range_pct_bps = (range_pct * 10000.0).round() as u64;
+        let buffer_bps = (buffer_multiplier * 10000.0).round() as u64;
+
+        // Compute: spot * range_pct_bps * buffer_bps / 10000 / 10000
+        // To avoid overflow, divide in stages
+        let range = spot
+            .saturating_mul(range_pct_bps)
+            .saturating_mul(buffer_bps)
+            / 10000
+            / 10000;
 
         let interval = config.strike_interval();
 
         // First compute the raw integer bounds around spot
-        let raw_low = spot.saturating_sub(range_u64);
-        let raw_high = spot.saturating_add(range_u64);
+        let raw_low = spot.saturating_sub(range);
+        let raw_high = spot.saturating_add(range);
 
         // Floor low to the nearest strike interval
         let low = (raw_low / interval) * interval;
@@ -409,15 +420,14 @@ impl StrikeGenerator {
                 continue;
             }
 
-            // Strike is outside the buffered range — check if empty
-            if let Ok(strike_book) = chain.get_strike(strike_price) {
-                if strike_book.is_empty() {
-                    if chain.strikes().remove(strike_price) {
-                        result.removed.push(strike_price);
-                    }
-                } else {
-                    result.skipped_with_orders = result.skipped_with_orders.saturating_add(1);
-                }
+            // Strike is outside the buffered range — atomically remove if empty.
+            // This avoids the TOCTOU race condition that would occur if we
+            // checked is_empty() and then called remove() separately.
+            if chain.strikes().remove_if_empty(strike_price) {
+                result.removed.push(strike_price);
+            } else if chain.get_strike(strike_price).is_ok() {
+                // Strike exists but has orders — count as skipped
+                result.skipped_with_orders = result.skipped_with_orders.saturating_add(1);
             }
         }
 

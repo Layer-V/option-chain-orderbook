@@ -396,19 +396,38 @@ fn chain_status(chain: &super::chain::OptionChainOrderBook) -> Option<Instrument
 /// Sets the lifecycle status on all option books (call and put) across every
 /// strike in the chain.
 ///
-/// This function only moves statuses *forward* in the lifecycle (based on the
-/// enum's ordering), so it will not downgrade a book that has already advanced
-/// further in another thread.
+/// This function only moves statuses *forward* in the lifecycle using atomic
+/// compare-and-swap (CAS) operations. It will not downgrade a book that has
+/// already advanced further, and concurrent calls are safe.
+///
+/// The CAS loop ensures that even under high concurrency, status transitions
+/// are monotonic and no transitions are lost or duplicated.
 fn set_all_book_status(chain: &super::chain::OptionChainOrderBook, status: InstrumentStatus) {
     for entry in chain.strikes().iter() {
         let strike = entry.value();
-        // Only advance the call book if we're moving forward in the lifecycle
-        if strike.call().status() < status {
-            strike.call().set_status(status);
+
+        // CAS loop for call book: advance only if current < target
+        loop {
+            let current = strike.call().status();
+            if current >= status {
+                break; // Already at or past target status
+            }
+            if strike.call().compare_and_set_status(current, status) {
+                break; // Successfully advanced
+            }
+            // CAS failed — another thread advanced it, retry to check new value
         }
-        // Only advance the put book if we're moving forward in the lifecycle
-        if strike.put().status() < status {
-            strike.put().set_status(status);
+
+        // CAS loop for put book: advance only if current < target
+        loop {
+            let current = strike.put().status();
+            if current >= status {
+                break; // Already at or past target status
+            }
+            if strike.put().compare_and_set_status(current, status) {
+                break; // Successfully advanced
+            }
+            // CAS failed — another thread advanced it, retry to check new value
         }
     }
 }

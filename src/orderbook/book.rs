@@ -516,6 +516,39 @@ impl OptionOrderBook {
         self.status.store(status as u8, Ordering::Release);
     }
 
+    /// Atomically compares and sets the lifecycle status.
+    ///
+    /// If the current status equals `expected`, sets it to `new` and returns `true`.
+    /// Otherwise, leaves the status unchanged and returns `false`.
+    ///
+    /// This provides a thread-safe way to advance status without race conditions,
+    /// ensuring monotonic status progression under concurrent access.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected` - The expected current status
+    /// * `new` - The new status to set if current equals expected
+    ///
+    /// # Returns
+    ///
+    /// `true` if the swap succeeded, `false` otherwise.
+    #[inline]
+    #[must_use]
+    pub fn compare_and_set_status(
+        &self,
+        expected: InstrumentStatus,
+        new: InstrumentStatus,
+    ) -> bool {
+        self.status
+            .compare_exchange(
+                expected as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     /// Halts the instrument, preventing new orders from being accepted.
     ///
     /// Existing resting orders are not cancelled. Use [`expire`](Self::expire)

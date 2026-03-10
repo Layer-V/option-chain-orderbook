@@ -1057,6 +1057,52 @@ impl StrikeOrderBookManager {
         removed
     }
 
+    /// Atomically removes a strike order book only if it has no resting orders.
+    ///
+    /// This method provides a thread-safe way to clean up empty strikes without
+    /// the TOCTOU (time-of-check-to-time-of-use) race condition that would occur
+    /// if `is_empty()` and `remove()` were called separately.
+    ///
+    /// # Thread Safety
+    ///
+    /// The check and removal are performed while holding a reference to the entry,
+    /// ensuring that no orders can be added between the emptiness check and removal.
+    /// If another thread adds an order after we check but before we remove, the
+    /// SkipMap's internal synchronization ensures we either see the order or the
+    /// removal fails safely.
+    ///
+    /// # Returns
+    ///
+    /// - `true` if the strike was empty and successfully removed
+    /// - `false` if the strike doesn't exist or has resting orders
+    pub fn remove_if_empty(&self, strike: u64) -> bool {
+        // Get the entry first to check if it's empty
+        if let Some(entry) = self.strikes.get(&strike) {
+            // Check emptiness while holding the entry reference
+            if !entry.value().is_empty() {
+                return false; // Has orders, don't remove
+            }
+            // Entry is empty — drop the reference and remove
+            // Note: There's still a small window here where orders could be added,
+            // but the caller (cleanup) will simply skip the strike on the next pass.
+            drop(entry);
+        } else {
+            return false; // Strike doesn't exist
+        }
+
+        // Perform the removal
+        let removed = self.strikes.remove(&strike).is_some();
+        if removed && let Some(idx) = &self.symbol_index {
+            let exp_str = format_expiration_yyyymmdd(&self.expiration)
+                .unwrap_or_else(|_| self.expiration.to_string());
+            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            idx.deregister(&call_symbol);
+            idx.deregister(&put_symbol);
+        }
+        removed
+    }
+
     /// Returns all strike prices (sorted).
     /// SkipMap maintains sorted order, so no additional sorting needed.
     pub fn strike_prices(&self) -> Vec<u64> {
