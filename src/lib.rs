@@ -222,8 +222,10 @@ pub mod utils;
 pub use error::{Error, Result};
 pub use orderbook::{
     CleanupResult, CycleRule, ExpirationCallback, ExpiryCycleConfig, ExpiryLifecycleManager,
-    ExpiryScheduler, ExpiryType, LifecycleConfig, LifecycleEvent, LifecycleListener,
-    LifecycleResult, RefreshResult, StrikeGenerator, StrikeRangeConfig, StrikeRangeConfigBuilder,
-    SymbolIndex, SymbolRef,
+    ExpiryScheduler, ExpiryType, IndexPriceFeed, LifecycleConfig, LifecycleEvent,
+    LifecycleListener, LifecycleResult, MarkPriceCalculator, MarkPriceConfig,
+    MarkPriceConfigBuilder, MockPriceFeed, PriceUpdate, PriceUpdateListener, RefreshResult,
+    StaticPriceFeed, StrikeGenerator, StrikeRangeConfig, StrikeRangeConfigBuilder, SymbolIndex,
+    SymbolRef, wire_feed_to_calculator,
 };
 pub use utils::{ParsedSymbol, SymbolParser};
