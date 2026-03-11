@@ -310,21 +310,6 @@ fn generate_quarterly(
 
 // ─── Date arithmetic helpers ──────────────────────────────────────────────────
 
-/// Returns the next Friday strictly after `date`.
-///
-/// If `date` is itself a Friday, returns the Friday 7 days later.
-#[allow(dead_code)]
-fn next_friday_after(date: NaiveDate) -> Result<NaiveDate> {
-    // num_days_from_monday(): Mon=0 Tue=1 Wed=2 Thu=3 Fri=4 Sat=5 Sun=6
-    let weekday_num = date.weekday().num_days_from_monday() as i64;
-    // Days until the *next* Friday (strictly after today):
-    // If today is Fri (4), result would be 0 → use 7 instead.
-    let days = (4 - weekday_num + 7) % 7;
-    let days = if days == 0 { 7 } else { days };
-    date.checked_add_signed(Duration::days(days))
-        .ok_or_else(|| Error::configuration("date overflow finding next Friday"))
-}
-
 /// Returns the next Friday on or after `from`, considering expiry time.
 ///
 /// If `from` is on a Friday and before the expiry time, returns that Friday.
@@ -669,39 +654,6 @@ mod tests {
             settlement_time_utc: (8, 61),
         };
         assert!(config.validate().is_err());
-    }
-
-    // ── next_friday_after ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_next_friday_after_monday() {
-        // 2026-03-02 is Monday; next Friday is 2026-03-06
-        let result = next_friday_after(date(2026, 3, 2)).expect("ok");
-        assert_eq!(result.weekday(), Weekday::Fri);
-        assert_eq!(result, date(2026, 3, 6));
-    }
-
-    #[test]
-    fn test_next_friday_after_friday_skips_to_next_week() {
-        // 2026-03-06 is Friday; next Friday should be 2026-03-13
-        let result = next_friday_after(date(2026, 3, 6)).expect("ok");
-        assert_eq!(result.weekday(), Weekday::Fri);
-        assert_eq!(result, date(2026, 3, 13));
-    }
-
-    #[test]
-    fn test_next_friday_after_saturday() {
-        // 2026-03-07 is Saturday; next Friday is 2026-03-13
-        let result = next_friday_after(date(2026, 3, 7)).expect("ok");
-        assert_eq!(result.weekday(), Weekday::Fri);
-        assert_eq!(result, date(2026, 3, 13));
-    }
-
-    #[test]
-    fn test_next_friday_after_sunday() {
-        // 2026-03-08 is Sunday; next Friday is 2026-03-13
-        let result = next_friday_after(date(2026, 3, 8)).expect("ok");
-        assert_eq!(result, date(2026, 3, 13));
     }
 
     // ── last_day_of_month ────────────────────────────────────────────────────

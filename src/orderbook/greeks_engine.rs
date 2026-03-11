@@ -299,10 +299,15 @@ impl GreeksEngine {
             side: Side::Long,
             underlying_symbol: String::new(),
             strike_price: strike_pos,
-            expiration_date: ExpirationDate::Days(tte_pos * Positive::new(365.0).unwrap()),
+            expiration_date: ExpirationDate::Days(
+                tte_pos
+                    * Positive::new(365.0)
+                        .map_err(|_| Error::greeks("failed to create days-per-year constant"))?,
+            ),
             implied_volatility: iv_pos,
             quantity: Positive::ONE,
             underlying_price: spot_pos,
+            // Graceful fallback: use 5% if the f64 → Decimal conversion fails.
             risk_free_rate: Decimal::try_from(risk_free_rate).unwrap_or(dec!(0.05)),
             option_style: style,
             dividend_yield: div_yield,
