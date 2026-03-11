@@ -98,7 +98,7 @@ pub use greeks_engine::{
 };
 pub use index_price_feed::{
     IndexPriceFeed, MockPriceFeed, PriceUpdate, PriceUpdateListener, StaticPriceFeed,
-    wire_feed_to_calculator,
+    SubscriptionId, wire_feed_to_calculator,
 };
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;

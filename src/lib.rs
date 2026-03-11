@@ -227,7 +227,7 @@ pub use orderbook::{
     LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult, MarkPriceCalculator,
     MarkPriceConfig, MarkPriceConfigBuilder, MockPriceFeed, Position, PriceUpdate,
     PriceUpdateListener, RefreshResult, StaticPriceFeed, StrikeGenerator, StrikeRangeConfig,
-    StrikeRangeConfigBuilder, SymbolIndex, SymbolRef, VolSurface, calculate_tte_years,
-    wire_feed_to_calculator,
+    StrikeRangeConfigBuilder, SubscriptionId, SymbolIndex, SymbolRef, VolSurface,
+    calculate_tte_years, wire_feed_to_calculator,
 };
 pub use utils::{ParsedSymbol, SymbolParser};
