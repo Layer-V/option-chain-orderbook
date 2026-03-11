@@ -133,8 +133,7 @@ impl AggregatedGreeks {
         self.charm = charm;
         self.color = color;
         self.position_count = self.position_count.saturating_add(1);
-        self.saturated = self.saturated
-            || sat1
+        let new_saturation = sat1
             || sat2
             || sat3
             || sat4
@@ -146,6 +145,13 @@ impl AggregatedGreeks {
             || sat10
             || sat11
             || sat12;
+        if new_saturation && !self.saturated {
+            tracing::warn!(
+                position_count = self.position_count,
+                "greeks aggregation saturated to Decimal::MAX/MIN — aggregate values are indicative only"
+            );
+        }
+        self.saturated = self.saturated || new_saturation;
     }
 }
 
