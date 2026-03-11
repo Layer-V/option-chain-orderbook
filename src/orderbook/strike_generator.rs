@@ -49,6 +49,28 @@ use super::chain::OptionChainOrderBook;
 use super::strike_range::StrikeRangeConfig;
 use crate::error::{Error, Result};
 
+/// Converts an `f64` value to basis points (`value * 10000`) as `u64`.
+///
+/// Returns an error if the value is non-finite, negative, or overflows `u64`.
+#[inline]
+fn f64_to_u64_bps(value: f64, name: &str) -> Result<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(Error::configuration(format!(
+            "{} must be a finite non-negative number, got {}",
+            name, value
+        )));
+    }
+    let rounded = (value * 10000.0).round();
+    if rounded > u64::MAX as f64 {
+        return Err(Error::configuration(format!(
+            "{} overflows basis-point conversion: {}",
+            name, value
+        )));
+    }
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    Ok(rounded as u64)
+}
+
 /// Zero-sized strike generation utility.
 ///
 /// Provides static methods for computing strike prices from a spot price and
@@ -120,7 +142,7 @@ impl StrikeGenerator {
         // Compute range bounds using integer arithmetic for deterministic behavior.
         // Convert range_pct to basis points (multiply by 10000) to avoid f64 jitter.
         // range = spot * range_pct = spot * (range_pct_bps / 10000)
-        let range_pct_bps = (range_pct * 10000.0).round() as u64;
+        let range_pct_bps = f64_to_u64_bps(range_pct, "range_pct")?;
         let range = spot
             .checked_mul(range_pct_bps)
             .ok_or_else(|| Error::configuration("overflow computing range"))?
@@ -384,8 +406,8 @@ impl StrikeGenerator {
         // range = spot * range_pct * buffer_multiplier
         //       = spot * (range_pct_bps / 10000) * buffer_multiplier
         let range_pct = config.range_pct();
-        let range_pct_bps = (range_pct * 10000.0).round() as u64;
-        let buffer_bps = (buffer_multiplier * 10000.0).round() as u64;
+        let range_pct_bps = f64_to_u64_bps(range_pct, "range_pct")?;
+        let buffer_bps = f64_to_u64_bps(buffer_multiplier, "buffer_multiplier")?;
 
         // Compute: spot * range_pct_bps * buffer_bps / 10000 / 10000
         // To avoid overflow, divide in stages

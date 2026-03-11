@@ -67,12 +67,22 @@ pub fn parse_yyyymmdd(date_str: &str, symbol: &str) -> Result<ExpirationDate> {
     let naive_date = NaiveDate::parse_from_str(date_str, "%Y%m%d")
         .map_err(|_| Error::invalid_symbol(symbol, format!("invalid date '{}'", date_str)))?;
 
-    let naive_datetime = naive_date
-        .and_hms_opt(23, 59, 59)
-        .expect("23:59:59 is always a valid time");
+    let naive_datetime = naive_date.and_hms_opt(23, 59, 59).ok_or_else(|| {
+        Error::invalid_symbol(symbol, "failed to construct expiration time 23:59:59")
+    })?;
     let datetime = Utc.from_utc_datetime(&naive_datetime);
 
     Ok(ExpirationDate::DateTime(datetime))
+}
+
+/// Returns the current wall-clock time as nanoseconds since Unix epoch.
+///
+/// Falls back to `0` if the system clock is unavailable or before the epoch.
+#[inline]
+pub(crate) fn nanos_since_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 /// Parsed components of an option symbol.

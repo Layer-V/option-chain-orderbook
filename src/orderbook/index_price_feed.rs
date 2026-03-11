@@ -42,6 +42,7 @@
 //! ```
 
 use super::mark_price::MarkPriceCalculator;
+use crate::utils::nanos_since_epoch;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -395,19 +396,6 @@ pub fn wire_feed_to_calculator(
     });
 
     feed.subscribe(listener)
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Returns the current wall-clock time as nanoseconds since Unix epoch.
-///
-/// Falls back to `0` if the system clock is unavailable or before the epoch.
-#[inline]
-fn nanos_since_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

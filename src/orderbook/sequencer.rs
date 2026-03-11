@@ -25,6 +25,7 @@
 use crate::error::Error;
 use crate::orderbook::book::TerminalOrderSummary;
 use crate::orderbook::underlying::UnderlyingOrderBook;
+use crate::utils::nanos_since_epoch;
 use optionstratlib::ExpirationDate;
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
@@ -333,7 +334,7 @@ impl OptionChainSequencer {
     #[inline]
     pub fn assign(&self) -> (u64, u64) {
         let seq = self.sequence.fetch_add(1, Ordering::AcqRel);
-        let ts = Self::current_time_ns();
+        let ts = nanos_since_epoch();
         (seq, ts)
     }
 
@@ -347,15 +348,6 @@ impl OptionChainSequencer {
     #[inline]
     pub fn record_reject(&self) {
         self.reject_count.fetch_add(1, Ordering::Release);
-    }
-
-    /// Returns the current time in nanoseconds since Unix epoch.
-    #[inline]
-    fn current_time_ns() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0)
     }
 }
 
