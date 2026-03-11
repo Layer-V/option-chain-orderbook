@@ -225,9 +225,14 @@ impl InMemoryOptionChainJournal {
     }
 
     /// Returns the number of stored events.
+    ///
+    /// Recovers from a poisoned lock instead of silently reporting zero.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.events.lock().map(|g| g.len()).unwrap_or(0)
+        match self.events.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 
     /// Returns `true` if the journal contains no events.
@@ -260,10 +265,10 @@ impl OptionChainJournal for InMemoryOptionChainJournal {
     }
 
     fn last_sequence(&self) -> Option<u64> {
-        self.events
-            .lock()
-            .ok()
-            .and_then(|g| g.last().map(|e| e.sequence_num))
+        match self.events.lock() {
+            Ok(guard) => guard.last().map(|e| e.sequence_num),
+            Err(poisoned) => poisoned.into_inner().last().map(|e| e.sequence_num),
+        }
     }
 }
 
@@ -305,21 +310,21 @@ impl OptionChainSequencer {
     #[must_use]
     #[inline]
     pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
+        self.sequence.load(Ordering::Acquire)
     }
 
     /// Returns the count of successfully executed commands.
     #[must_use]
     #[inline]
     pub fn success_count(&self) -> u64 {
-        self.success_count.load(Ordering::Relaxed)
+        self.success_count.load(Ordering::Acquire)
     }
 
     /// Returns the count of rejected commands.
     #[must_use]
     #[inline]
     pub fn reject_count(&self) -> u64 {
-        self.reject_count.load(Ordering::Relaxed)
+        self.reject_count.load(Ordering::Acquire)
     }
 
     /// Assigns a sequence number and timestamp to a command.
@@ -327,7 +332,7 @@ impl OptionChainSequencer {
     /// Returns `(sequence_num, timestamp_ns)`.
     #[inline]
     pub fn assign(&self) -> (u64, u64) {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let seq = self.sequence.fetch_add(1, Ordering::AcqRel);
         let ts = Self::current_time_ns();
         (seq, ts)
     }
@@ -335,13 +340,13 @@ impl OptionChainSequencer {
     /// Records a successful execution.
     #[inline]
     pub fn record_success(&self) {
-        self.success_count.fetch_add(1, Ordering::Relaxed);
+        self.success_count.fetch_add(1, Ordering::Release);
     }
 
     /// Records a rejected command.
     #[inline]
     pub fn record_reject(&self) {
-        self.reject_count.fetch_add(1, Ordering::Relaxed);
+        self.reject_count.fetch_add(1, Ordering::Release);
     }
 
     /// Returns the current time in nanoseconds since Unix epoch.
@@ -932,8 +937,14 @@ impl SequencedUnderlyingOrderBook {
     /// Replays events from the journal starting at `from_sequence`.
     ///
     /// Each event's command is re-executed against the underlying order
-    /// book, and the sequencer is advanced past the highest replayed
-    /// sequence number so that new commands receive non-conflicting ids.
+    /// book to rebuild state. The sequencer is then advanced past the
+    /// highest replayed sequence number so that new commands receive
+    /// non-conflicting ids.
+    ///
+    /// Re-execution results are intentionally discarded because replay
+    /// runs against an empty (or partially populated) book whose state
+    /// may differ from the original run. This method is a state-rebuild
+    /// tool, not a validation tool.
     ///
     /// Returns the number of events replayed.
     ///
@@ -949,13 +960,25 @@ impl SequencedUnderlyingOrderBook {
         let events = journal.read_from(from_sequence)?;
         let count = events.len();
 
+        let mut max_next: u64 = 0;
+
         for event in &events {
-            // Re-execute command (result is discarded — we trust journal state)
+            // Re-execute command to rebuild order book state.
+            // Results are discarded — see method doc for rationale.
             let _ = self.execute_command(&event.command);
 
-            // Advance sequencer past the replayed range
             let next = event.sequence_num.saturating_add(1);
-            self.sequencer.sequence.fetch_max(next, Ordering::Relaxed);
+            if next > max_next {
+                max_next = next;
+            }
+        }
+
+        // Advance sequencer past the replayed range in a single atomic
+        // operation instead of one fetch_max per event.
+        if max_next > 0 {
+            self.sequencer
+                .sequence
+                .fetch_max(max_next, Ordering::Release);
         }
 
         Ok(count)
