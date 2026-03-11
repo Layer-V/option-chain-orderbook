@@ -26,7 +26,6 @@ use crate::error::Error;
 use crate::orderbook::book::TerminalOrderSummary;
 use crate::orderbook::underlying::UnderlyingOrderBook;
 use optionstratlib::ExpirationDate;
-use orderbook_rs::prelude::{Journal, SequencerCommand, SequencerEvent, SequencerResult};
 use orderbook_rs::{OrderId, Side};
 use pricelevel::Hash32;
 use serde::{Deserialize, Serialize};
@@ -172,6 +171,107 @@ pub struct OptionChainReceipt {
     pub result: OptionChainResult,
 }
 
+/// Journal trait for option chain events.
+///
+/// Provides append and read operations for [`OptionChainEvent`] persistence,
+/// replacing the upstream `Journal<()>` placeholder encoding with a
+/// purpose-built abstraction.
+///
+/// # Thread Safety
+///
+/// Implementations must be `Send + Sync`. The intended pattern is
+/// single-writer (the sequencer) with concurrent readers (replay,
+/// monitoring).
+pub trait OptionChainJournal: Send + Sync {
+    /// Appends an event to the journal.
+    ///
+    /// The event must be durably persisted before this method returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if serialization or I/O fails.
+    fn append(&self, event: &OptionChainEvent) -> Result<(), Error>;
+
+    /// Reads events starting from the given sequence number (inclusive).
+    ///
+    /// Returns events in sequence order. If `sequence` is beyond the
+    /// last entry, returns an empty `Vec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if deserialization or I/O fails.
+    fn read_from(&self, sequence: u64) -> Result<Vec<OptionChainEvent>, Error>;
+
+    /// Returns the sequence number of the last entry, or `None` if empty.
+    #[must_use]
+    fn last_sequence(&self) -> Option<u64>;
+}
+
+/// In-memory journal for testing and lightweight usage.
+///
+/// Stores events in a `Mutex<Vec<OptionChainEvent>>`. Not suitable for
+/// production persistence but useful for unit tests and replay validation.
+#[derive(Debug, Default)]
+pub struct InMemoryOptionChainJournal {
+    /// Stored events in sequence order.
+    events: std::sync::Mutex<Vec<OptionChainEvent>>,
+}
+
+impl InMemoryOptionChainJournal {
+    /// Creates a new empty in-memory journal.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored events.
+    ///
+    /// Recovers from a poisoned lock instead of silently reporting zero.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self.events.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
+    /// Returns `true` if the journal contains no events.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl OptionChainJournal for InMemoryOptionChainJournal {
+    fn append(&self, event: &OptionChainEvent) -> Result<(), Error> {
+        let mut guard = self
+            .events
+            .lock()
+            .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
+        guard.push(event.clone());
+        Ok(())
+    }
+
+    fn read_from(&self, sequence: u64) -> Result<Vec<OptionChainEvent>, Error> {
+        let guard = self
+            .events
+            .lock()
+            .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
+        Ok(guard
+            .iter()
+            .filter(|e| e.sequence_num >= sequence)
+            .cloned()
+            .collect())
+    }
+
+    fn last_sequence(&self) -> Option<u64> {
+        match self.events.lock() {
+            Ok(guard) => guard.last().map(|e| e.sequence_num),
+            Err(poisoned) => poisoned.into_inner().last().map(|e| e.sequence_num),
+        }
+    }
+}
+
 /// Internal sequencer that assigns sequence numbers and timestamps.
 pub(crate) struct OptionChainSequencer {
     /// Next sequence number to assign.
@@ -210,21 +310,21 @@ impl OptionChainSequencer {
     #[must_use]
     #[inline]
     pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
+        self.sequence.load(Ordering::Acquire)
     }
 
     /// Returns the count of successfully executed commands.
     #[must_use]
     #[inline]
     pub fn success_count(&self) -> u64 {
-        self.success_count.load(Ordering::Relaxed)
+        self.success_count.load(Ordering::Acquire)
     }
 
     /// Returns the count of rejected commands.
     #[must_use]
     #[inline]
     pub fn reject_count(&self) -> u64 {
-        self.reject_count.load(Ordering::Relaxed)
+        self.reject_count.load(Ordering::Acquire)
     }
 
     /// Assigns a sequence number and timestamp to a command.
@@ -232,7 +332,7 @@ impl OptionChainSequencer {
     /// Returns `(sequence_num, timestamp_ns)`.
     #[inline]
     pub fn assign(&self) -> (u64, u64) {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+        let seq = self.sequence.fetch_add(1, Ordering::AcqRel);
         let ts = Self::current_time_ns();
         (seq, ts)
     }
@@ -240,13 +340,13 @@ impl OptionChainSequencer {
     /// Records a successful execution.
     #[inline]
     pub fn record_success(&self) {
-        self.success_count.fetch_add(1, Ordering::Relaxed);
+        self.success_count.fetch_add(1, Ordering::Release);
     }
 
     /// Records a rejected command.
     #[inline]
     pub fn record_reject(&self) {
-        self.reject_count.fetch_add(1, Ordering::Relaxed);
+        self.reject_count.fetch_add(1, Ordering::Release);
     }
 
     /// Returns the current time in nanoseconds since Unix epoch.
@@ -295,7 +395,7 @@ pub struct SequencedUnderlyingOrderBook {
     /// The sequencer for assigning sequence numbers.
     sequencer: OptionChainSequencer,
     /// Optional journal for event persistence.
-    journal: Option<Arc<dyn Journal<()> + Send + Sync>>,
+    journal: Option<Arc<dyn OptionChainJournal>>,
 }
 
 impl SequencedUnderlyingOrderBook {
@@ -313,7 +413,7 @@ impl SequencedUnderlyingOrderBook {
     #[must_use]
     pub fn with_journal(
         underlying: impl Into<String>,
-        journal: Arc<dyn Journal<()> + Send + Sync>,
+        journal: Arc<dyn OptionChainJournal>,
     ) -> Self {
         Self {
             inner: UnderlyingOrderBook::new(underlying),
@@ -336,7 +436,7 @@ impl SequencedUnderlyingOrderBook {
     #[must_use]
     pub fn from_underlying_with_journal(
         underlying: UnderlyingOrderBook,
-        journal: Arc<dyn Journal<()> + Send + Sync>,
+        journal: Arc<dyn OptionChainJournal>,
     ) -> Self {
         Self {
             inner: underlying,
@@ -410,8 +510,7 @@ impl SequencedUnderlyingOrderBook {
                 command,
                 result: result.clone(),
             };
-            // Convert to orderbook-rs event format for journal
-            self.persist_event(&event, journal.as_ref())?;
+            journal.append(&event)?;
         }
 
         Ok(OptionChainReceipt {
@@ -835,30 +934,54 @@ impl SequencedUnderlyingOrderBook {
         Ok(ExpirationDate::DateTime(datetime_utc))
     }
 
-    /// Persists an event to the journal.
-    fn persist_event(
-        &self,
-        event: &OptionChainEvent,
-        journal: &(dyn Journal<()> + Send + Sync),
-    ) -> Result<(), Error> {
-        // Serialize to JSON for persistence
-        let json = serde_json::to_string(event)
-            .map_err(|e| Error::journal_error(format!("serialization failed: {}", e)))?;
+    /// Replays events from the journal starting at `from_sequence`.
+    ///
+    /// Each event's command is re-executed against the underlying order
+    /// book to rebuild state. The sequencer is then advanced past the
+    /// highest replayed sequence number so that new commands receive
+    /// non-conflicting ids.
+    ///
+    /// Re-execution results are intentionally discarded because replay
+    /// runs against an empty (or partially populated) book whose state
+    /// may differ from the original run. This method is a state-rebuild
+    /// tool, not a validation tool.
+    ///
+    /// Returns the number of events replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the journal cannot be read.
+    pub fn replay(&self, from_sequence: u64) -> Result<usize, Error> {
+        let journal = self
+            .journal
+            .as_ref()
+            .ok_or_else(|| Error::journal_error("replay requires a journal"))?;
 
-        // Create a dummy sequencer event for the journal
-        // In practice, we'd want a custom journal type
-        let seq_event = SequencerEvent {
-            sequence_num: event.sequence_num,
-            timestamp_ns: event.timestamp_ns,
-            command: SequencerCommand::CancelAll, // Placeholder
-            result: SequencerResult::Rejected {
-                reason: json, // Store our event as JSON in reason field
-            },
-        };
+        let events = journal.read_from(from_sequence)?;
+        let count = events.len();
 
-        journal
-            .append(&seq_event)
-            .map_err(|e| Error::journal_error(format!("append failed: {}", e)))
+        let mut max_next: u64 = 0;
+
+        for event in &events {
+            // Re-execute command to rebuild order book state.
+            // Results are discarded — see method doc for rationale.
+            let _ = self.execute_command(&event.command);
+
+            let next = event.sequence_num.saturating_add(1);
+            if next > max_next {
+                max_next = next;
+            }
+        }
+
+        // Advance sequencer past the replayed range in a single atomic
+        // operation instead of one fetch_max per event.
+        if max_next > 0 {
+            self.sequencer
+                .sequence
+                .fetch_max(max_next, Ordering::Release);
+        }
+
+        Ok(count)
     }
 
     // ── Delegated Read Operations ────────────────────────────────────────
@@ -973,5 +1096,162 @@ mod tests {
         let scope = MassCancelScope::Underlying;
         let json = serde_json::to_string(&scope).expect("serialize");
         assert!(json.contains("Underlying"));
+    }
+
+    // ── InMemoryOptionChainJournal ──────────────────────────────────────
+
+    #[test]
+    fn test_in_memory_journal_empty() {
+        let journal = InMemoryOptionChainJournal::new();
+        assert!(journal.is_empty());
+        assert_eq!(journal.len(), 0);
+        assert_eq!(journal.last_sequence(), None);
+    }
+
+    #[test]
+    fn test_in_memory_journal_append_and_read() {
+        let journal = InMemoryOptionChainJournal::new();
+
+        let event = OptionChainEvent {
+            sequence_num: 0,
+            timestamp_ns: 1000,
+            command: OptionChainCommand::CancelOrder {
+                symbol: "BTC-20240329-50000-C".to_string(),
+                order_id: OrderId::new(),
+            },
+            result: OptionChainResult::Rejected {
+                reason: "test".to_string(),
+            },
+        };
+
+        journal.append(&event).expect("append");
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal.last_sequence(), Some(0));
+
+        let events = journal.read_from(0).expect("read");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence_num, 0);
+    }
+
+    #[test]
+    fn test_in_memory_journal_read_from_filters() {
+        let journal = InMemoryOptionChainJournal::new();
+
+        for i in 0..5 {
+            let event = OptionChainEvent {
+                sequence_num: i,
+                timestamp_ns: i * 1000,
+                command: OptionChainCommand::CancelOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::new(),
+                },
+                result: OptionChainResult::Rejected {
+                    reason: "test".to_string(),
+                },
+            };
+            journal.append(&event).expect("append");
+        }
+
+        assert_eq!(journal.len(), 5);
+        assert_eq!(journal.last_sequence(), Some(4));
+
+        let from_2 = journal.read_from(2).expect("read");
+        assert_eq!(from_2.len(), 3); // seq 2, 3, 4
+
+        let from_10 = journal.read_from(10).expect("read");
+        assert!(from_10.is_empty());
+    }
+
+    // ── Journaled sequenced book ────────────────────────────────────────
+
+    #[test]
+    fn test_sequenced_book_with_journal() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        assert!(book.has_journal());
+
+        // Submit a command that will be rejected (no expiration exists)
+        let receipt = book
+            .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+
+        assert!(receipt.result.is_error()); // book not found
+        assert_eq!(receipt.sequence_num, 0);
+
+        // Event should be in the journal
+        assert_eq!(journal.last_sequence(), Some(0));
+        let events = journal.read_from(0).expect("read");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn test_replay_without_journal_errors() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        let result = book.replay(0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_replay_empty_journal() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+
+        let count = book.replay(0).expect("replay");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_replay_advances_sequence() {
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+
+        // Pre-populate journal with events
+        for i in 0..3 {
+            let event = OptionChainEvent {
+                sequence_num: i,
+                timestamp_ns: i * 1000,
+                command: OptionChainCommand::CancelOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::new(),
+                },
+                result: OptionChainResult::BookNotFound {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                },
+            };
+            journal.append(&event).expect("append");
+        }
+
+        let book = SequencedUnderlyingOrderBook::with_journal("BTC", Arc::clone(&journal));
+        assert_eq!(book.current_sequence(), 0);
+
+        let count = book.replay(0).expect("replay");
+        assert_eq!(count, 3);
+
+        // Sequence should be advanced past the replayed range
+        assert!(book.current_sequence() >= 3);
+    }
+
+    #[test]
+    fn test_event_serialization_roundtrip() {
+        let event = OptionChainEvent {
+            sequence_num: 42,
+            timestamp_ns: 1_000_000,
+            command: OptionChainCommand::AddOrder {
+                symbol: "BTC-20240329-50000-C".to_string(),
+                order_id: OrderId::new(),
+                side: Side::Buy,
+                price: 100,
+                quantity: 10,
+            },
+            result: OptionChainResult::OrderAdded {
+                order_id: OrderId::new(),
+            },
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize");
+        let deserialized: OptionChainEvent = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.sequence_num, 42);
+        assert_eq!(deserialized.timestamp_ns, 1_000_000);
     }
 }
