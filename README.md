@@ -109,8 +109,10 @@ let exp_date = ExpirationDate::Days(pos_or_panic!(30.0));
     let strike = exp.get_or_create_strike(50000);
 
     // Add orders to call
-    strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10).unwrap();
-    strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5).unwrap();
+    strike.call().add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        .expect("add order should succeed");
+    strike.call().add_limit_order(OrderId::new(), Side::Sell, 105, 5)
+        .expect("add order should succeed");
 
     // Get quote
     let quote = strike.call().best_quote();
@@ -132,8 +134,10 @@ use orderbook_rs::{OrderId, Side};
 let book = OptionOrderBook::new("BTC-20240329-50000-C", OptionStyle::Call);
 
 // Add limit orders
-book.add_limit_order(OrderId::new(), Side::Buy, 500, 10).unwrap();
-book.add_limit_order(OrderId::new(), Side::Sell, 520, 5).unwrap();
+book.add_limit_order(OrderId::new(), Side::Buy, 500, 10)
+    .expect("add order should succeed");
+book.add_limit_order(OrderId::new(), Side::Sell, 520, 5)
+    .expect("add order should succeed");
 
 // Get the best quote
 let quote = book.best_quote();
@@ -164,8 +168,8 @@ let option = Options {
     exotic_params: None,
 };
 
-let delta_value = delta(&option).unwrap();
-let gamma_value = gamma(&option).unwrap();
+let delta_value = delta(&option).expect("delta calculation should succeed");
+let gamma_value = gamma(&option).expect("gamma calculation should succeed");
 ```
 
 ### Examples
@@ -180,6 +184,8 @@ The library includes comprehensive examples demonstrating each level of the hier
 | `04_expiration_orderbook` | Expiration level with term structure |
 | `05_underlying_orderbook` | Underlying level (all expirations) |
 | `06_full_hierarchy` | Complete hierarchy with trading scenarios |
+| `07_mass_cancel` | Hierarchical mass cancel operations |
+| `08_order_lifecycle` | Order state tracking and lifecycle queries |
 
 Run examples with:
 ```bash

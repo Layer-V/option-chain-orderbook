@@ -51,29 +51,84 @@ mod book;
 mod chain;
 mod contract_specs;
 mod expiration;
+mod expiry_cycle;
+mod expiry_lifecycle;
+mod expiry_scheduler;
 mod fees;
+pub mod greeks_aggregator;
+pub mod greeks_engine;
+mod index_price_feed;
 mod instrument_registry;
 mod instrument_status;
+mod mark_price;
 mod quote;
 mod stp;
 mod strike;
+mod strike_generator;
+mod strike_range;
+pub mod symbol_index;
 mod underlying;
 mod validation;
 
+#[cfg(feature = "nats")]
+pub mod nats;
+
+#[cfg(feature = "sequencer")]
+pub mod sequencer;
+
 // Re-export all public types
-pub use book::OptionOrderBook;
-pub use chain::{OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats};
+pub use book::{OptionOrderBook, TerminalOrderSummary};
+pub use chain::{
+    ChainMassCancelResult, OptionChainOrderBook, OptionChainOrderBookManager, OptionChainStats,
+};
 pub use contract_specs::{ContractSpecs, ContractSpecsBuilder, ExerciseStyle, SettlementType};
-pub use expiration::{ExpirationManagerStats, ExpirationOrderBook, ExpirationOrderBookManager};
+pub use expiration::{
+    ExpirationManagerStats, ExpirationMassCancelResult, ExpirationOrderBook,
+    ExpirationOrderBookManager,
+};
+pub use expiry_cycle::{CycleRule, ExpiryCycleConfig};
+pub use expiry_lifecycle::{
+    ExpiryLifecycleManager, LifecycleConfig, LifecycleEvent, LifecycleListener, LifecycleResult,
+};
+pub use expiry_scheduler::{ExpirationCallback, ExpiryScheduler, RefreshResult};
+pub use greeks_aggregator::{AggregatedGreeks, GreeksAggregator, Position};
+pub use greeks_engine::{
+    FlatVolSurface, GreeksEngine, GreeksRecalcTrigger, GreeksUpdate, GreeksUpdateListener,
+    VolSurface, calculate_tte_years,
+};
+pub use index_price_feed::{
+    IndexPriceFeed, MockPriceFeed, PriceUpdate, PriceUpdateListener, StaticPriceFeed,
+    SubscriptionId, wire_feed_to_calculator,
+};
 pub use instrument_registry::{InstrumentInfo, InstrumentRegistry};
 pub use instrument_status::InstrumentStatus;
+pub use mark_price::{MarkPriceCalculator, MarkPriceConfig, MarkPriceConfigBuilder};
 pub use quote::{Quote, QuoteUpdate};
-pub use strike::{StrikeOrderBook, StrikeOrderBookManager};
+pub use strike::{StrikeMassCancelResult, StrikeOrderBook, StrikeOrderBookManager};
+pub use strike_generator::{CleanupResult, StrikeGenerator};
+pub use strike_range::{ExpiryType, StrikeRangeConfig, StrikeRangeConfigBuilder};
+pub use symbol_index::{SymbolIndex, SymbolRef};
 pub use underlying::{
-    GlobalStats, UnderlyingOrderBook, UnderlyingOrderBookManager, UnderlyingStats,
+    GlobalMassCancelResult, GlobalStats, UnderlyingMassCancelResult, UnderlyingOrderBook,
+    UnderlyingOrderBookManager, UnderlyingStats,
 };
 pub use validation::ValidationConfig;
 
+#[cfg(feature = "nats")]
+pub use book::NatsPublisherHandles;
+#[cfg(feature = "nats")]
+pub use nats::{OptionChainNatsConfig, OptionChainSubjectBuilder};
+
+#[cfg(feature = "sequencer")]
+pub use sequencer::{
+    InMemoryOptionChainJournal, MassCancelScope, MassCancelType, OptionChainCommand,
+    OptionChainEvent, OptionChainJournal, OptionChainReceipt, OptionChainResult,
+    SequencedUnderlyingOrderBook,
+};
+
 // Re-export upstream types used in the public API
-pub use orderbook_rs::{FeeSchedule, STPMode, TradeResult};
+pub use orderbook_rs::{
+    CancelReason, FeeSchedule, MassCancelResult, OrderStateTracker, OrderStatus, STPMode,
+    TradeResult,
+};
 pub use pricelevel::Hash32;

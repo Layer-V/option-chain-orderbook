@@ -3,17 +3,20 @@ name: SEMVER
 on:
   push:
     branches:
-      - '**'
+      - "**"
   pull_request:
     branches:
       - main
-      - 'release/**'
+      - "release/**"
 
 # Cancel any in-flight jobs for the same PR/branch so there's only one active
 # at a time
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   RUST_BACKTRACE: full

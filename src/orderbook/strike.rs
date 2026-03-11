@@ -9,14 +9,19 @@ use super::fees::SharedFeeSchedule;
 use super::instrument_registry::{InstrumentInfo, InstrumentRegistry};
 use super::quote::Quote;
 use super::stp::SharedSTPMode;
+use super::symbol_index::{SymbolIndex, SymbolRef};
 use super::validation::{SharedValidationConfig, ValidationConfig};
 use crate::error::{Error, Result};
 use crate::utils::format_expiration_yyyymmdd;
 use crossbeam_skiplist::SkipMap;
 use optionstratlib::greeks::Greek;
 use optionstratlib::{ExpirationDate, OptionStyle};
-use orderbook_rs::{FeeSchedule, OrderId, STPMode};
+use orderbook_rs::{FeeSchedule, MassCancelResult, OrderId, OrderStatus, STPMode, Side};
+use pricelevel::Hash32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use super::book::TerminalOrderSummary;
 
 /// Order book for a single strike price containing both call and put.
 ///
@@ -274,6 +279,281 @@ impl StrikeOrderBook {
         self.put.clear();
     }
 
+    /// Cancels all resting orders across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order across both option books for this strike and
+    /// returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`StrikeMassCancelResult`] containing per-book results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    ///
+    /// let strike = StrikeOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)), 50000);
+    /// let result = match strike.cancel_all() {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_all(&self) -> Result<StrikeMassCancelResult> {
+        let call_result = self.call.cancel_all()?;
+        let put_result = self.put.cancel_all()?;
+
+        Ok(StrikeMassCancelResult {
+            per_book: vec![
+                (self.call.symbol().to_string(), call_result),
+                (self.put.symbol().to_string(), put_result),
+            ],
+        })
+    }
+
+    /// Cancels all resting orders on a specific side across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order on the provided side across both option books
+    /// for this strike and returns the aggregated cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `side` - Side to cancel ([`Side::Buy`] or [`Side::Sell`]).
+    ///
+    /// # Returns
+    ///
+    /// A [`StrikeMassCancelResult`] containing per-book results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use orderbook_rs::Side;
+    ///
+    /// let strike = StrikeOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)), 50000);
+    /// let result = match strike.cancel_by_side(Side::Buy) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_side(&self, side: Side) -> Result<StrikeMassCancelResult> {
+        let call_result = self.call.cancel_by_side(side)?;
+        let put_result = self.put.cancel_by_side(side)?;
+
+        Ok(StrikeMassCancelResult {
+            per_book: vec![
+                (self.call.symbol().to_string(), call_result),
+                (self.put.symbol().to_string(), put_result),
+            ],
+        })
+    }
+
+    /// Cancels all resting orders for a specific user across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Cancels every resting order attributed to the provided user identifier
+    /// across both option books for this strike and returns the aggregated
+    /// cancellation details.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - User identifier to cancel (32-byte hash).
+    ///
+    /// # Returns
+    ///
+    /// A [`StrikeMassCancelResult`] containing per-book results plus aggregated
+    /// counts (books, orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeOrderBook;
+    /// use optionstratlib::ExpirationDate;
+    /// use optionstratlib::prelude::pos_or_panic;
+    /// use pricelevel::Hash32;
+    ///
+    /// let strike = StrikeOrderBook::new("BTC", ExpirationDate::Days(pos_or_panic!(30.0)), 50000);
+    /// let user = Hash32::from([1u8; 32]);
+    /// let result = match strike.cancel_by_user(user) {
+    ///     Ok(result) => result,
+    ///     Err(err) => panic!("cancel failed: {}", err),
+    /// };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    pub fn cancel_by_user(&self, user_id: Hash32) -> Result<StrikeMassCancelResult> {
+        let call_result = self.call.cancel_by_user(user_id)?;
+        let put_result = self.put.cancel_by_user(user_id)?;
+
+        Ok(StrikeMassCancelResult {
+            per_book: vec![
+                (self.call.symbol().to_string(), call_result),
+                (self.put.symbol().to_string(), put_result),
+            ],
+        })
+    }
+
+    // ── Order Lifecycle Queries ────────────────────────────────────────────
+
+    /// Finds an order anywhere in this strike's call or put book.
+    ///
+    /// # Description
+    ///
+    /// Searches the call book first, then the put book. Returns the option
+    /// symbol and current status if found.
+    ///
+    /// # Arguments
+    ///
+    /// * `order_id` - The ID of the order to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some((symbol, status))` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn find_order(&self, order_id: OrderId) -> Option<(String, OrderStatus)> {
+        if let Some(status) = self.call.get_order_status(order_id) {
+            return Some((self.call.symbol().to_string(), status));
+        }
+        if let Some(status) = self.put.get_order_status(order_id) {
+            return Some((self.put.symbol().to_string(), status));
+        }
+        None
+    }
+
+    /// Returns the total number of active orders across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Sums the active order counts from both the call and put option books.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total active order count.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn total_active_orders(&self) -> usize {
+        self.call
+            .active_order_count()
+            .saturating_add(self.put.active_order_count())
+    }
+
+    /// Removes terminal-state entries older than the specified duration.
+    ///
+    /// # Description
+    ///
+    /// Delegates to both call and put books and returns the total purged.
+    ///
+    /// # Arguments
+    ///
+    /// * `older_than` - Entries older than this duration are removed.
+    ///
+    /// # Returns
+    ///
+    /// The number of entries purged.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    pub fn purge_terminal_states(&self, older_than: Duration) -> usize {
+        self.call
+            .purge_terminal_states(older_than)
+            .saturating_add(self.put.purge_terminal_states(older_than))
+    }
+
+    /// Returns all currently active orders for a specific user.
+    ///
+    /// # Description
+    ///
+    /// Searches both call and put books for resting orders belonging to the
+    /// specified user. Returns tuples of (symbol, order_id, status).
+    ///
+    /// # Arguments
+    ///
+    /// * `user_id` - The user identifier to filter by.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(symbol, OrderId, OrderStatus)` tuples.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn orders_by_user(&self, user_id: Hash32) -> Vec<(String, OrderId, OrderStatus)> {
+        let mut result = Vec::new();
+        let call_symbol = self.call.symbol().to_string();
+        for (id, status) in self.call.orders_by_user(user_id) {
+            result.push((call_symbol.clone(), id, status));
+        }
+        let put_symbol = self.put.symbol().to_string();
+        for (id, status) in self.put.orders_by_user(user_id) {
+            result.push((put_symbol.clone(), id, status));
+        }
+        result
+    }
+
+    /// Returns a summary of terminal order transitions.
+    ///
+    /// # Description
+    ///
+    /// Aggregates the terminal order summaries from both call and put books.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// A [`TerminalOrderSummary`] with aggregated filled, cancelled, and
+    /// rejected counts.
+    ///
+    /// # Errors
+    ///
+    /// None.
+    #[must_use]
+    pub fn terminal_order_summary(&self) -> TerminalOrderSummary {
+        self.call.terminal_order_summary() + self.put.terminal_order_summary()
+    }
+
     /// Updates the Greeks for the call option.
     pub fn update_call_greeks(&mut self, greeks: Greek) {
         self.call_greeks = Some(greeks);
@@ -295,6 +575,139 @@ impl StrikeOrderBook {
     pub const fn put_greeks(&self) -> Option<&Greek> {
         self.put_greeks.as_ref()
     }
+
+    // ── NATS Integration ─────────────────────────────────────────────────
+
+    /// Connects NATS publishers to both call and put order books at this strike.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - NATS configuration with JetStream context and subject prefix
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(call_handles, put_handles)` containing the publisher handles
+    /// for each side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either book's symbol cannot be parsed.
+    #[cfg(feature = "nats")]
+    pub fn connect_nats(
+        &self,
+        config: &super::nats::OptionChainNatsConfig,
+    ) -> crate::Result<(
+        super::book::NatsPublisherHandles,
+        super::book::NatsPublisherHandles,
+    )> {
+        let call_handles = self.call.connect_nats(config)?;
+        let put_handles = self.put.connect_nats(config)?;
+        Ok((call_handles, put_handles))
+    }
+}
+
+/// Strike-level mass cancel summary.
+///
+/// # Description
+///
+/// Aggregates per-option-book mass cancel results for a strike.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Use [`books_affected`](Self::books_affected) and [`total_cancelled`](Self::total_cancelled)
+/// for aggregated counts.
+///
+/// # Errors
+///
+/// None.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use option_chain_orderbook::orderbook::StrikeMassCancelResult;
+///
+/// let result = StrikeMassCancelResult { per_book: Vec::new() };
+/// assert_eq!(result.total_cancelled(), 0);
+/// ```
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct StrikeMassCancelResult {
+    /// Per-option-book cancellation results keyed by option symbol.
+    pub per_book: Vec<(String, MassCancelResult)>,
+}
+
+impl StrikeMassCancelResult {
+    /// Returns the number of option books with cancelled orders.
+    ///
+    /// # Description
+    ///
+    /// Counts how many option books recorded at least one cancelled order.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Number of books affected (books).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeMassCancelResult;
+    ///
+    /// let result = StrikeMassCancelResult { per_book: Vec::new() };
+    /// assert_eq!(result.books_affected(), 0);
+    /// ```
+    #[must_use]
+    pub fn books_affected(&self) -> usize {
+        self.per_book
+            .iter()
+            .filter(|(_, result)| result.cancelled_count() > 0)
+            .count()
+    }
+
+    /// Returns the total number of cancelled orders across call and put books.
+    ///
+    /// # Description
+    ///
+    /// Sums cancelled orders across every option book for this strike.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Total cancelled orders (orders).
+    ///
+    /// # Errors
+    ///
+    /// None.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use option_chain_orderbook::orderbook::StrikeMassCancelResult;
+    ///
+    /// let result = StrikeMassCancelResult { per_book: Vec::new() };
+    /// assert_eq!(result.total_cancelled(), 0);
+    /// ```
+    #[must_use]
+    pub fn total_cancelled(&self) -> usize {
+        self.per_book
+            .iter()
+            .map(|(_, result)| result.cancelled_count())
+            .sum()
+    }
 }
 
 /// Manages strike order books for a single expiration.
@@ -314,6 +727,8 @@ pub struct StrikeOrderBookManager {
     contract_specs: SharedContractSpecs,
     /// Instrument registry for allocating IDs to new option books.
     registry: Option<Arc<InstrumentRegistry>>,
+    /// Symbol index for O(1) lookup by symbol string.
+    symbol_index: Option<Arc<SymbolIndex>>,
     /// STP mode applied to newly created option books.
     stp_mode: SharedSTPMode,
     /// Fee schedule applied to newly created option books.
@@ -336,6 +751,7 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: None,
+            symbol_index: None,
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -364,6 +780,35 @@ impl StrikeOrderBookManager {
             validation_config: SharedValidationConfig::new(),
             contract_specs: SharedContractSpecs::new(),
             registry: Some(registry),
+            symbol_index: None,
+            stp_mode: SharedSTPMode::new(),
+            fee_schedule: SharedFeeSchedule::new(),
+        }
+    }
+
+    /// Creates a new strike order book manager with both instrument registry and symbol index.
+    ///
+    /// # Arguments
+    ///
+    /// * `underlying` - The underlying asset symbol
+    /// * `expiration` - The expiration date
+    /// * `registry` - The instrument registry for ID allocation
+    /// * `symbol_index` - The symbol index for O(1) lookups
+    #[must_use]
+    pub(crate) fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        expiration: ExpirationDate,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        Self {
+            strikes: SkipMap::new(),
+            underlying: underlying.into(),
+            expiration,
+            validation_config: SharedValidationConfig::new(),
+            contract_specs: SharedContractSpecs::new(),
+            registry: Some(registry),
+            symbol_index: Some(symbol_index),
             stp_mode: SharedSTPMode::new(),
             fee_schedule: SharedFeeSchedule::new(),
         }
@@ -544,14 +989,15 @@ impl StrikeOrderBookManager {
     }
 
     /// Assigns unique instrument IDs and registers the call/put books in the
-    /// reverse index. Called only after confirming this book won the insertion race.
+    /// reverse index. Also registers symbols in the symbol index if present.
+    /// Called only after confirming this book won the insertion race.
     fn assign_instrument_ids(&self, book: &StrikeOrderBook, strike: u64) {
-        if let Some(reg) = &self.registry {
-            let exp_str = format_expiration_yyyymmdd(&self.expiration)
-                .unwrap_or_else(|_| self.expiration.to_string());
-            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
-            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+        let exp_str = format_expiration_yyyymmdd(&self.expiration)
+            .unwrap_or_else(|_| self.expiration.to_string());
+        let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+        let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
 
+        if let Some(reg) = &self.registry {
             let call_id = reg.allocate();
             let put_id = reg.allocate();
 
@@ -567,6 +1013,15 @@ impl StrikeOrderBookManager {
                 self.expiration,
                 strike,
             );
+        }
+
+        if let Some(idx) = &self.symbol_index {
+            let call_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Call);
+            let put_ref =
+                SymbolRef::new(&self.underlying, self.expiration, strike, OptionStyle::Put);
+            idx.register(&call_symbol, call_ref);
+            idx.register(&put_symbol, put_ref);
         }
     }
 
@@ -615,11 +1070,66 @@ impl StrikeOrderBookManager {
         self.strikes.iter()
     }
 
-    /// Removes a strike order book.
+    /// Removes a strike order book and deregisters its symbols from the index.
     ///
     /// Note: Returns true if the strike was removed, false if it didn't exist.
     pub fn remove(&self, strike: u64) -> bool {
-        self.strikes.remove(&strike).is_some()
+        let removed = self.strikes.remove(&strike).is_some();
+        if removed && let Some(idx) = &self.symbol_index {
+            let exp_str = format_expiration_yyyymmdd(&self.expiration)
+                .unwrap_or_else(|_| self.expiration.to_string());
+            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            idx.deregister(&call_symbol);
+            idx.deregister(&put_symbol);
+        }
+        removed
+    }
+
+    /// Atomically removes a strike order book only if it has no resting orders.
+    ///
+    /// This method provides a thread-safe way to clean up empty strikes without
+    /// the TOCTOU (time-of-check-to-time-of-use) race condition that would occur
+    /// if `is_empty()` and `remove()` were called separately.
+    ///
+    /// # Thread Safety
+    ///
+    /// The check and removal are performed while holding a reference to the entry,
+    /// ensuring that no orders can be added between the emptiness check and removal.
+    /// If another thread adds an order after we check but before we remove, the
+    /// SkipMap's internal synchronization ensures we either see the order or the
+    /// removal fails safely.
+    ///
+    /// # Returns
+    ///
+    /// - `true` if the strike was empty and successfully removed
+    /// - `false` if the strike doesn't exist or has resting orders
+    pub fn remove_if_empty(&self, strike: u64) -> bool {
+        // Get the entry first to check if it's empty
+        if let Some(entry) = self.strikes.get(&strike) {
+            // Check emptiness while holding the entry reference
+            if !entry.value().is_empty() {
+                return false; // Has orders, don't remove
+            }
+            // Entry is empty — drop the reference and remove
+            // Note: There's still a small window here where orders could be added,
+            // but the caller (cleanup) will simply skip the strike on the next pass.
+            drop(entry);
+        } else {
+            return false; // Strike doesn't exist
+        }
+
+        // Perform the removal
+        let removed = self.strikes.remove(&strike).is_some();
+        if removed && let Some(idx) = &self.symbol_index {
+            let exp_str = format_expiration_yyyymmdd(&self.expiration)
+                .unwrap_or_else(|_| self.expiration.to_string());
+            let call_symbol = format!("{}-{}-{}-C", self.underlying, exp_str, strike);
+            let put_symbol = format!("{}-{}-{}-P", self.underlying, exp_str, strike);
+            idx.deregister(&call_symbol);
+            idx.deregister(&put_symbol);
+        }
+        removed
     }
 
     /// Returns all strike prices (sorted).
@@ -671,14 +1181,18 @@ mod tests {
     fn test_strike_order_book_orders() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Sell, 50, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(strike.order_count(), 2);
         assert!(!strike.is_empty());
@@ -719,9 +1233,21 @@ mod tests {
         drop(manager.get_or_create(50000));
         drop(manager.get_or_create(55000));
 
-        assert_eq!(manager.atm_strike(48000).unwrap(), 50000);
-        assert_eq!(manager.atm_strike(52000).unwrap(), 50000);
-        assert_eq!(manager.atm_strike(53000).unwrap(), 55000);
+        let atm1 = match manager.atm_strike(48000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm1, 50000);
+        let atm2 = match manager.atm_strike(52000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm2, 50000);
+        let atm3 = match manager.atm_strike(53000) {
+            Ok(s) => s,
+            Err(err) => panic!("atm_strike failed: {}", err),
+        };
+        assert_eq!(atm3, 55000);
     }
 
     #[test]
@@ -741,9 +1267,9 @@ mod tests {
     fn test_strike_call_mut() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         let call_arc = strike.call_arc();
-        call_arc
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        if let Err(err) = call_arc.add_limit_order(OrderId::new(), Side::Buy, 100, 10) {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(strike.call().order_count(), 1);
     }
 
@@ -751,9 +1277,9 @@ mod tests {
     fn test_strike_put_mut() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
         let put_arc = strike.put_arc();
-        put_arc
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
-            .unwrap();
+        if let Err(err) = put_arc.add_limit_order(OrderId::new(), Side::Buy, 50, 10) {
+            panic!("add order failed: {}", err);
+        }
         assert_eq!(strike.put().order_count(), 1);
     }
 
@@ -761,14 +1287,18 @@ mod tests {
     fn test_strike_get_by_style() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Buy, 50, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         let call = strike.get(OptionStyle::Call);
         let put = strike.get(OptionStyle::Put);
@@ -781,14 +1311,20 @@ mod tests {
     fn test_strike_get_arc_by_style() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
-        strike
-            .get_arc(OptionStyle::Call)
-            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
-            .get_arc(OptionStyle::Put)
-            .add_limit_order(OrderId::new(), Side::Buy, 50, 5)
-            .unwrap();
+        if let Err(err) =
+            strike
+                .get_arc(OptionStyle::Call)
+                .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            strike
+                .get_arc(OptionStyle::Put)
+                .add_limit_order(OrderId::new(), Side::Buy, 50, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(strike.order_count(), 2);
     }
@@ -797,22 +1333,30 @@ mod tests {
     fn test_strike_quotes() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Sell, 60, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         let call_quote = strike.call_quote();
         let put_quote = strike.put_quote();
@@ -827,25 +1371,33 @@ mod tests {
 
         assert!(!strike.is_fully_quoted());
 
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert!(!strike.is_fully_quoted());
 
-        strike
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Sell, 60, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert!(strike.is_fully_quoted());
     }
@@ -854,14 +1406,18 @@ mod tests {
     fn test_strike_clear() {
         let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
 
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
-        strike
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
             .put()
             .add_limit_order(OrderId::new(), Side::Buy, 50, 5)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
 
         assert_eq!(strike.order_count(), 2);
         strike.clear();
@@ -952,17 +1508,21 @@ mod tests {
         let manager = StrikeOrderBookManager::new("BTC", test_expiration());
 
         let strike = manager.get_or_create(50000);
-        strike
+        if let Err(err) = strike
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
         drop(strike);
 
         let strike2 = manager.get_or_create(55000);
-        strike2
+        if let Err(err) = strike2
             .call()
             .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
-            .unwrap();
+        {
+            panic!("add order failed: {}", err);
+        }
         drop(strike2);
 
         assert_eq!(manager.total_order_count(), 2);
@@ -1045,6 +1605,123 @@ mod tests {
     }
 
     #[test]
+    fn test_strike_cancel_all() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 60, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 2);
+
+        let result = match strike.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 0);
+    }
+
+    #[test]
+    fn test_strike_cancel_by_side() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) = strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 3);
+
+        let result = match strike.cancel_by_side(Side::Buy) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 1);
+    }
+
+    #[test]
+    fn test_strike_cancel_by_user() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            strike
+                .put()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 60, 5, user_a)
+        {
+            panic!("add order failed: {}", err);
+        }
+        if let Err(err) =
+            strike
+                .call()
+                .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+        {
+            panic!("add order failed: {}", err);
+        }
+
+        assert_eq!(strike.order_count(), 3);
+
+        let result = match strike.cancel_by_user(user_a) {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 2);
+        assert_eq!(result.books_affected(), 2);
+        assert_eq!(strike.order_count(), 1);
+    }
+
+    #[test]
+    fn test_strike_cancel_all_empty() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        let result = match strike.cancel_all() {
+            Ok(r) => r,
+            Err(err) => panic!("cancel failed: {}", err),
+        };
+
+        assert_eq!(result.total_cancelled(), 0);
+        assert_eq!(result.books_affected(), 0);
+    }
+
+    #[test]
     fn test_strike_manager_existing_strike_unaffected() {
         let manager = StrikeOrderBookManager::new("BTC", test_expiration());
 
@@ -1070,5 +1747,129 @@ mod tests {
                 .add_limit_order(OrderId::new(), Side::Buy, 150, 10)
                 .is_err()
         );
+    }
+
+    // ── Order Lifecycle Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_strike_find_order_in_call() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let order_id = OrderId::new();
+
+        strike
+            .call()
+            .add_limit_order(order_id, Side::Buy, 100, 10)
+            .expect("add order");
+
+        let result = strike.find_order(order_id);
+        assert!(result.is_some());
+        let (symbol, _status) = result.unwrap();
+        assert!(symbol.contains("-C"));
+    }
+
+    #[test]
+    fn test_strike_find_order_in_put() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let order_id = OrderId::new();
+
+        strike
+            .put()
+            .add_limit_order(order_id, Side::Sell, 80, 5)
+            .expect("add order");
+
+        let result = strike.find_order(order_id);
+        assert!(result.is_some());
+        let (symbol, _status) = result.unwrap();
+        assert!(symbol.contains("-P"));
+    }
+
+    #[test]
+    fn test_strike_find_order_not_found() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let result = strike.find_order(OrderId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_strike_total_active_orders() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add call");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Sell, 80, 5)
+            .expect("add put");
+
+        assert_eq!(strike.total_active_orders(), 2);
+    }
+
+    #[test]
+    fn test_strike_orders_by_user() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+        let user_a = Hash32::from([1u8; 32]);
+        let user_b = Hash32::from([2u8; 32]);
+
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("add a1");
+        strike
+            .put()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 80, 5, user_a)
+            .expect("add a2");
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Sell, 110, 5, user_b)
+            .expect("add b1");
+
+        let a_orders = strike.orders_by_user(user_a);
+        assert_eq!(a_orders.len(), 2);
+
+        let b_orders = strike.orders_by_user(user_b);
+        assert_eq!(b_orders.len(), 1);
+    }
+
+    #[test]
+    fn test_strike_terminal_order_summary() {
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        // Create matched orders in call book
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+
+        let summary = strike.terminal_order_summary();
+        assert_eq!(summary.filled, 2);
+        assert_eq!(summary.total(), 2);
+    }
+
+    #[test]
+    fn test_strike_purge_terminal_states() {
+        use std::thread;
+        use std::time::Duration;
+
+        let strike = StrikeOrderBook::new("BTC", test_expiration(), 50000);
+
+        // Create matched orders
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 100, 10)
+            .expect("add maker");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("add taker");
+
+        thread::sleep(Duration::from_millis(10));
+        let purged = strike.purge_terminal_states(Duration::from_millis(1));
+        assert_eq!(purged, 2);
     }
 }

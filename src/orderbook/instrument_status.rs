@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// This enum is stored as an [`AtomicU8`](std::sync::atomic::AtomicU8) inside
 /// [`OptionOrderBook`](super::book::OptionOrderBook) for lock-free concurrent access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum InstrumentStatus {
     /// Instrument is pending activation (not yet trading).
@@ -179,8 +179,14 @@ mod tests {
             InstrumentStatus::Settling,
             InstrumentStatus::Expired,
         ] {
-            let json = serde_json::to_string(&status).expect("serialize");
-            let deserialized: InstrumentStatus = serde_json::from_str(&json).expect("deserialize");
+            let json = match serde_json::to_string(&status) {
+                Ok(j) => j,
+                Err(err) => panic!("serialization failed: {}", err),
+            };
+            let deserialized: InstrumentStatus = match serde_json::from_str(&json) {
+                Ok(d) => d,
+                Err(err) => panic!("deserialization failed: {}", err),
+            };
             assert_eq!(status, deserialized);
         }
     }

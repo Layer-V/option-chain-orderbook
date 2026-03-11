@@ -11,9 +11,11 @@
 
 mod chain_bench;
 mod expiration_bench;
+mod greeks_aggregator_bench;
 mod hierarchy_bench;
 mod orderbook_bench;
 mod strike_bench;
+mod strike_generator_bench;
 mod underlying_bench;
 
 use criterion::{criterion_group, criterion_main};
@@ -65,11 +67,26 @@ criterion_group!(
     hierarchy_bench::hierarchy_scaling,
 );
 
+// StrikeGenerator benchmarks
+criterion_group!(
+    strike_generator_benches,
+    strike_generator_bench::strike_generator_operations,
+    strike_generator_bench::strike_generator_scaling,
+);
+
+// GreeksAggregator benchmarks
+criterion_group!(
+    greeks_aggregator_benches,
+    greeks_aggregator_bench::greeks_aggregator_operations,
+);
+
 criterion_main!(
     orderbook_benches,
     strike_benches,
     chain_benches,
     expiration_benches,
     underlying_benches,
-    hierarchy_benches
+    hierarchy_benches,
+    strike_generator_benches,
+    greeks_aggregator_benches
 );

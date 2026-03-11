@@ -160,6 +160,29 @@ pub enum Error {
     /// Error from expiration date operations.
     #[error("expiration date error: {0}")]
     ExpirationDateError(#[from] optionstratlib::model::ExpirationDateError),
+
+    /// Error when a symbol string is malformed.
+    #[error("invalid symbol '{symbol}': {reason}")]
+    InvalidSymbol {
+        /// The malformed symbol.
+        symbol: String,
+        /// Reason for the error.
+        reason: String,
+    },
+
+    /// Error when a symbol is not found in the index.
+    #[error("symbol not found: {symbol}")]
+    SymbolNotFound {
+        /// The symbol that was not found.
+        symbol: String,
+    },
+
+    /// Error when a journal operation fails.
+    #[error("journal error: {message}")]
+    JournalError {
+        /// Description of the journal error.
+        message: String,
+    },
 }
 
 impl Error {
@@ -312,6 +335,31 @@ impl Error {
             message: message.into(),
         }
     }
+
+    /// Creates a new invalid symbol error.
+    #[must_use]
+    pub fn invalid_symbol(symbol: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::InvalidSymbol {
+            symbol: symbol.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// Creates a new symbol not found error.
+    #[must_use]
+    pub fn symbol_not_found(symbol: impl Into<String>) -> Self {
+        Self::SymbolNotFound {
+            symbol: symbol.into(),
+        }
+    }
+
+    /// Creates a new journal error.
+    #[must_use]
+    pub fn journal_error(message: impl Into<String>) -> Self {
+        Self::JournalError {
+            message: message.into(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -442,13 +490,29 @@ mod tests {
 
     #[test]
     fn test_instrument_not_active_error() {
-        let err = Error::instrument_not_active(
-            "BTC-20240329-50000-C",
-            InstrumentStatus::Halted,
-        );
+        let err = Error::instrument_not_active("BTC-20240329-50000-C", InstrumentStatus::Halted);
         let msg = err.to_string();
         assert!(msg.contains("BTC-20240329-50000-C"));
         assert!(msg.contains("Halted"));
         assert!(msg.contains("instrument not active"));
+    }
+
+    #[test]
+    fn test_invalid_symbol_error() {
+        let err = Error::invalid_symbol(
+            "BTC-bad-symbol",
+            "expected format UNDERLYING-YYYYMMDD-STRIKE-C|P",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("BTC-bad-symbol"));
+        assert!(msg.contains("expected format"));
+    }
+
+    #[test]
+    fn test_symbol_not_found_error() {
+        let err = Error::symbol_not_found("BTC-20260130-50000-C");
+        let msg = err.to_string();
+        assert!(msg.contains("symbol not found"));
+        assert!(msg.contains("BTC-20260130-50000-C"));
     }
 }

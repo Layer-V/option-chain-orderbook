@@ -451,18 +451,28 @@ mod tests {
             .settlement_currency("ETH")
             .build();
 
-        let json = serde_json::to_string(&specs).expect("serialization should succeed");
-        let deserialized: ContractSpecs =
-            serde_json::from_str(&json).expect("deserialization should succeed");
+        let json = match serde_json::to_string(&specs) {
+            Ok(j) => j,
+            Err(err) => panic!("serialization failed: {}", err),
+        };
+        let deserialized: ContractSpecs = match serde_json::from_str(&json) {
+            Ok(d) => d,
+            Err(err) => panic!("deserialization failed: {}", err),
+        };
         assert_eq!(specs, deserialized);
     }
 
     #[test]
     fn test_default_serialization_roundtrip() {
         let specs = ContractSpecs::default();
-        let json = serde_json::to_string(&specs).expect("serialization should succeed");
-        let deserialized: ContractSpecs =
-            serde_json::from_str(&json).expect("deserialization should succeed");
+        let json = match serde_json::to_string(&specs) {
+            Ok(j) => j,
+            Err(err) => panic!("serialization failed: {}", err),
+        };
+        let deserialized: ContractSpecs = match serde_json::from_str(&json) {
+            Ok(d) => d,
+            Err(err) => panic!("deserialization failed: {}", err),
+        };
         assert_eq!(specs, deserialized);
     }
 
@@ -511,18 +521,28 @@ mod tests {
     #[test]
     fn test_exercise_style_serialization() {
         let style = ExerciseStyle::American;
-        let json = serde_json::to_string(&style).expect("serialization should succeed");
-        let deserialized: ExerciseStyle =
-            serde_json::from_str(&json).expect("deserialization should succeed");
+        let json = match serde_json::to_string(&style) {
+            Ok(j) => j,
+            Err(err) => panic!("serialization failed: {}", err),
+        };
+        let deserialized: ExerciseStyle = match serde_json::from_str(&json) {
+            Ok(d) => d,
+            Err(err) => panic!("deserialization failed: {}", err),
+        };
         assert_eq!(style, deserialized);
     }
 
     #[test]
     fn test_settlement_type_serialization() {
         let stype = SettlementType::Physical;
-        let json = serde_json::to_string(&stype).expect("serialization should succeed");
-        let deserialized: SettlementType =
-            serde_json::from_str(&json).expect("deserialization should succeed");
+        let json = match serde_json::to_string(&stype) {
+            Ok(j) => j,
+            Err(err) => panic!("serialization failed: {}", err),
+        };
+        let deserialized: SettlementType = match serde_json::from_str(&json) {
+            Ok(d) => d,
+            Err(err) => panic!("deserialization failed: {}", err),
+        };
         assert_eq!(stype, deserialized);
     }
 
