@@ -308,10 +308,16 @@ impl GreeksAggregator {
     /// * `position` - The position to add
     pub fn add_position(&self, account: &str, position: Position) {
         let key = position.instrument_symbol.clone();
-        self.positions
-            .entry(account.to_string())
-            .or_default()
-            .insert(key, position);
+        // Fast path: avoid allocating a new String key when the account
+        // already exists (common case in hot loops).
+        if let Some(mut entry) = self.positions.get_mut(account) {
+            entry.value_mut().insert(key, position);
+        } else {
+            self.positions
+                .entry(account.to_string())
+                .or_default()
+                .insert(key, position);
+        }
     }
 
     /// Removes the position matching `instrument_symbol` from the account.
