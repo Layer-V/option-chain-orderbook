@@ -1246,4 +1246,530 @@ mod tests {
         assert_eq!(deserialized.sequence_num, 42);
         assert_eq!(deserialized.timestamp_ns, 1_000_000);
     }
+
+    // ── Helper ────────────────────────────────────────────────────────────
+
+    /// Builds a `SequencedUnderlyingOrderBook` with a real expiration, strike,
+    /// and resting orders so that command execution paths are exercisable.
+    fn make_book_with_orders() -> (SequencedUnderlyingOrderBook, ExpirationDate, String) {
+        use chrono::{NaiveDate, TimeZone, Utc};
+
+        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
+        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
+        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+
+        let underlying = UnderlyingOrderBook::new("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiry);
+        let strike = exp_book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Buy, 100, 10)
+            .expect("seed call buy");
+        strike
+            .call()
+            .add_limit_order(OrderId::new(), Side::Sell, 110, 5)
+            .expect("seed call sell");
+        strike
+            .put()
+            .add_limit_order(OrderId::new(), Side::Buy, 50, 10)
+            .expect("seed put buy");
+        drop(strike);
+        drop(exp_book);
+
+        let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
+        let symbol = "BTC-20240329-50000-C".to_string();
+        (book, expiry, symbol)
+    }
+
+    fn make_book_with_user_orders() -> (SequencedUnderlyingOrderBook, ExpirationDate) {
+        use chrono::{NaiveDate, TimeZone, Utc};
+
+        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
+        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
+        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+
+        let user_a = Hash32::from([1u8; 32]);
+
+        let underlying = UnderlyingOrderBook::new("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiry);
+        let strike = exp_book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("seed user order");
+        drop(strike);
+        drop(exp_book);
+
+        let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
+        (book, expiry)
+    }
+
+    // ── SequencedUnderlyingOrderBook constructors ─────────────────────────
+
+    #[test]
+    fn test_sequenced_book_from_underlying() {
+        let underlying = UnderlyingOrderBook::new("ETH");
+        let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
+
+        assert_eq!(book.underlying_symbol(), "ETH");
+        assert_eq!(book.current_sequence(), 0);
+        assert!(!book.has_journal());
+    }
+
+    #[test]
+    fn test_sequenced_book_from_underlying_with_journal() {
+        let underlying = UnderlyingOrderBook::new("ETH");
+        let journal: Arc<dyn OptionChainJournal> = Arc::new(InMemoryOptionChainJournal::new());
+        let book = SequencedUnderlyingOrderBook::from_underlying_with_journal(underlying, journal);
+
+        assert_eq!(book.underlying_symbol(), "ETH");
+        assert!(book.has_journal());
+    }
+
+    // ── Accessor & delegation tests ──────────────────────────────────────
+
+    #[test]
+    fn test_sequenced_book_underlying_accessor() {
+        let (book, _, _) = make_book_with_orders();
+        let inner = book.underlying();
+        assert_eq!(inner.underlying(), "BTC");
+    }
+
+    #[test]
+    fn test_sequenced_book_success_reject_counts() {
+        let (book, _, symbol) = make_book_with_orders();
+
+        // Successful add
+        let receipt = book
+            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 90, 5)
+            .expect("submit");
+        assert!(receipt.result.is_success());
+        assert_eq!(book.success_count(), 1);
+        assert_eq!(book.reject_count(), 0);
+
+        // Rejected: book not found
+        let receipt2 = book
+            .submit_add_order("INVALID", OrderId::new(), Side::Buy, 90, 5)
+            .expect("submit");
+        assert!(receipt2.result.is_error());
+        assert_eq!(book.success_count(), 1);
+        assert_eq!(book.reject_count(), 1);
+    }
+
+    #[test]
+    fn test_sequenced_book_expiration_count() {
+        let (book, _, _) = make_book_with_orders();
+        assert_eq!(book.expiration_count(), 1);
+    }
+
+    #[test]
+    fn test_sequenced_book_total_order_count() {
+        let (book, _, _) = make_book_with_orders();
+        // 3 seeded orders: call buy, call sell, put buy
+        assert_eq!(book.total_order_count(), 3);
+    }
+
+    #[test]
+    fn test_sequenced_book_terminal_order_summary() {
+        let (book, _, _) = make_book_with_orders();
+        let summary = book.terminal_order_summary();
+        // No fills occurred during seeding (no matching), so filled == 0
+        assert_eq!(summary.total(), 0);
+    }
+
+    #[test]
+    fn test_sequenced_book_debug() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+        let debug = format!("{:?}", book);
+        assert!(debug.contains("SequencedUnderlyingOrderBook"));
+        assert!(debug.contains("BTC"));
+    }
+
+    // ── Submit: add order ────────────────────────────────────────────────
+
+    #[test]
+    fn test_submit_add_order_success() {
+        let (book, _, symbol) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order(&symbol, OrderId::new(), Side::Buy, 95, 5)
+            .expect("submit");
+        assert!(receipt.result.is_success());
+        assert_eq!(receipt.sequence_num, 0);
+    }
+
+    #[test]
+    fn test_submit_add_order_book_not_found() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_add_order("BTC-20240329-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        assert!(receipt.result.is_error());
+        match &receipt.result {
+            OptionChainResult::BookNotFound { symbol } => {
+                assert!(symbol.contains("BTC"));
+            }
+            other => panic!("expected BookNotFound, got {:?}", other),
+        }
+    }
+
+    // ── Submit: cancel order ─────────────────────────────────────────────
+
+    #[test]
+    fn test_submit_cancel_order_book_not_found() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_cancel_order("BTC-20240329-50000-C", OrderId::new())
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    #[test]
+    fn test_submit_cancel_order_nonexistent() {
+        let (book, _, symbol) = make_book_with_orders();
+
+        // Cancel a random order_id that doesn't exist in the book.
+        // The underlying orderbook may treat this as a no-op success
+        // or a rejection depending on the implementation.
+        let receipt = book
+            .submit_cancel_order(&symbol, OrderId::new())
+            .expect("submit");
+        // Verify a receipt is returned with a valid sequence number
+        assert_eq!(receipt.sequence_num, 0);
+    }
+
+    // ── Mass cancel: Underlying scope ────────────────────────────────────
+
+    #[test]
+    fn test_mass_cancel_underlying_all() {
+        let (book, _, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(MassCancelScope::Underlying, MassCancelType::All)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 3);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_underlying_by_side() {
+        let (book, _, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Underlying,
+                MassCancelType::BySide(Side::Buy),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                // 2 buy orders: call buy + put buy
+                assert!(*cancelled_count >= 2);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_underlying_by_user() {
+        let (book, _) = make_book_with_user_orders();
+        let user_a = Hash32::from([1u8; 32]);
+
+        let receipt = book
+            .submit_mass_cancel(MassCancelScope::Underlying, MassCancelType::ByUser(user_a))
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    // ── Mass cancel: Expiration scope ────────────────────────────────────
+
+    #[test]
+    fn test_mass_cancel_expiration_all() {
+        let (book, expiry, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(MassCancelScope::Expiration(expiry), MassCancelType::All)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 3);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_expiration_by_side() {
+        let (book, expiry, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Expiration(expiry),
+                MassCancelType::BySide(Side::Sell),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                // 1 sell order: call sell
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_expiration_by_user() {
+        let (book, expiry) = make_book_with_user_orders();
+        let user_a = Hash32::from([1u8; 32]);
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Expiration(expiry),
+                MassCancelType::ByUser(user_a),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_expiration_not_found() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Expiration(ExpirationDate::Days(
+                    optionstratlib::prelude::pos_or_panic!(30.0),
+                )),
+                MassCancelType::All,
+            )
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    // ── Mass cancel: Strike scope ────────────────────────────────────────
+
+    #[test]
+    fn test_mass_cancel_strike_all() {
+        let (book, expiry, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Strike {
+                    expiration: expiry,
+                    strike: 50000,
+                },
+                MassCancelType::All,
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 3);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_strike_by_side() {
+        let (book, expiry, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Strike {
+                    expiration: expiry,
+                    strike: 50000,
+                },
+                MassCancelType::BySide(Side::Buy),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 2);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_strike_by_user() {
+        let (book, expiry) = make_book_with_user_orders();
+        let user_a = Hash32::from([1u8; 32]);
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Strike {
+                    expiration: expiry,
+                    strike: 50000,
+                },
+                MassCancelType::ByUser(user_a),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_strike_not_found() {
+        let (book, expiry, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Strike {
+                    expiration: expiry,
+                    strike: 99999,
+                },
+                MassCancelType::All,
+            )
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    // ── Mass cancel: Book scope ──────────────────────────────────────────
+
+    #[test]
+    fn test_mass_cancel_book_all() {
+        let (book, _, symbol) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(MassCancelScope::Book(symbol), MassCancelType::All)
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                // Call book has 2 orders (buy + sell)
+                assert!(*cancelled_count >= 2);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_book_by_side() {
+        let (book, _, symbol) = make_book_with_orders();
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Book(symbol),
+                MassCancelType::BySide(Side::Buy),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_book_by_user() {
+        use chrono::{NaiveDate, TimeZone, Utc};
+
+        let user_a = Hash32::from([1u8; 32]);
+        let date = NaiveDate::from_ymd_opt(2024, 3, 29).expect("valid date");
+        let dt = date.and_hms_opt(0, 0, 0).expect("valid time");
+        let expiry = ExpirationDate::DateTime(Utc.from_utc_datetime(&dt));
+
+        let underlying = UnderlyingOrderBook::new("BTC");
+        let exp_book = underlying.get_or_create_expiration(expiry);
+        let strike = exp_book.get_or_create_strike(50000);
+        strike
+            .call()
+            .add_limit_order_with_user(OrderId::new(), Side::Buy, 100, 10, user_a)
+            .expect("seed");
+        drop(strike);
+        drop(exp_book);
+
+        let book = SequencedUnderlyingOrderBook::from_underlying(underlying);
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Book("BTC-20240329-50000-C".to_string()),
+                MassCancelType::ByUser(user_a),
+            )
+            .expect("submit");
+        match &receipt.result {
+            OptionChainResult::MassCancelled { cancelled_count } => {
+                assert!(*cancelled_count >= 1);
+            }
+            other => panic!("expected MassCancelled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mass_cancel_book_not_found() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_mass_cancel(
+                MassCancelScope::Book("BTC-20240329-50000-C".to_string()),
+                MassCancelType::All,
+            )
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    // ── find_book_by_symbol error paths ──────────────────────────────────
+
+    #[test]
+    fn test_find_book_invalid_symbol_format() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_add_order("INVALID-FORMAT", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    #[test]
+    fn test_find_book_invalid_option_type() {
+        let (book, _, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order("BTC-20240329-50000-X", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    // ── parse_expiration ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_expiration_invalid() {
+        let book = SequencedUnderlyingOrderBook::new("BTC");
+
+        let receipt = book
+            .submit_add_order("BTC-NOTADATE-50000-C", OrderId::new(), Side::Buy, 100, 10)
+            .expect("submit");
+        assert!(receipt.result.is_error());
+    }
+
+    // ── put book path ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_submit_add_order_to_put_book() {
+        let (book, _, _) = make_book_with_orders();
+
+        let receipt = book
+            .submit_add_order("BTC-20240329-50000-P", OrderId::new(), Side::Buy, 40, 5)
+            .expect("submit");
+        assert!(receipt.result.is_success());
+    }
 }
