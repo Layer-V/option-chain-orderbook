@@ -1527,4 +1527,135 @@ mod tests {
         let purged = chain.purge_terminal_states(Duration::from_millis(1));
         assert_eq!(purged, 2);
     }
+
+    // ── OptionChainOrderBook accessor coverage ───────────────────────────
+
+    #[test]
+    fn test_chain_id_unique() {
+        let a = OptionChainOrderBook::new("BTC", test_expiration());
+        let b = OptionChainOrderBook::new("BTC", test_expiration());
+        // Each chain should get a distinct OrderId
+        assert_ne!(a.id(), b.id());
+    }
+
+    #[test]
+    fn test_chain_registry_none_by_default() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        assert!(chain.registry().is_none());
+    }
+
+    #[test]
+    fn test_chain_strikes_arc() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        drop(chain.get_or_create_strike(50000));
+
+        let arc = chain.strikes_arc();
+        assert_eq!(arc.len(), 1);
+    }
+
+    #[test]
+    fn test_chain_stp_mode_default_and_set() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        assert_eq!(chain.stp_mode(), STPMode::None);
+
+        chain.set_stp_mode(STPMode::CancelTaker);
+        assert_eq!(chain.stp_mode(), STPMode::CancelTaker);
+    }
+
+    #[test]
+    fn test_chain_fee_schedule_set_clear() {
+        let chain = OptionChainOrderBook::new("BTC", test_expiration());
+        assert!(chain.fee_schedule().is_none());
+
+        let schedule = FeeSchedule::new(-2, 5);
+        chain.set_fee_schedule(schedule);
+        assert!(chain.fee_schedule().is_some());
+
+        chain.clear_fee_schedule();
+        assert!(chain.fee_schedule().is_none());
+    }
+
+    // ── OptionChainOrderBookManager config propagation ───────────────────
+
+    #[test]
+    fn test_manager_set_specs_propagates() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        let specs = ContractSpecs::builder().tick_size(100).lot_size(1).build();
+        manager.set_specs(specs);
+
+        let chain = manager.get_or_create(test_expiration());
+        assert!(chain.specs().is_some());
+    }
+
+    #[test]
+    fn test_manager_specs_accessor() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        assert!(manager.specs().is_none());
+
+        let specs = ContractSpecs::builder().tick_size(100).lot_size(1).build();
+        manager.set_specs(specs);
+        assert!(manager.specs().is_some());
+    }
+
+    #[test]
+    fn test_manager_stp_mode_propagates() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        assert_eq!(manager.stp_mode(), STPMode::None);
+
+        manager.set_stp_mode(STPMode::CancelTaker);
+        assert_eq!(manager.stp_mode(), STPMode::CancelTaker);
+
+        let chain = manager.get_or_create(test_expiration());
+        assert_eq!(chain.stp_mode(), STPMode::CancelTaker);
+    }
+
+    #[test]
+    fn test_manager_fee_schedule_propagates() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        assert!(manager.fee_schedule().is_none());
+
+        let schedule = FeeSchedule::new(-2, 5);
+        manager.set_fee_schedule(schedule);
+        assert!(manager.fee_schedule().is_some());
+
+        let chain = manager.get_or_create(test_expiration());
+        assert!(chain.fee_schedule().is_some());
+    }
+
+    #[test]
+    fn test_manager_clear_fee_schedule() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        manager.set_fee_schedule(FeeSchedule::new(-2, 5));
+        assert!(manager.fee_schedule().is_some());
+
+        manager.clear_fee_schedule();
+        assert!(manager.fee_schedule().is_none());
+
+        // New chain should NOT inherit fees
+        let chain = manager.get_or_create(test_expiration());
+        assert!(chain.fee_schedule().is_none());
+    }
+
+    #[test]
+    fn test_manager_validation_config_accessor() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+        assert!(manager.validation_config().is_none());
+
+        let config = ValidationConfig::new().with_tick_size(100);
+        manager.set_validation(config);
+        assert!(manager.validation_config().is_some());
+    }
+
+    #[test]
+    fn test_manager_iter() {
+        let manager = OptionChainOrderBookManager::new("BTC");
+
+        drop(manager.get_or_create(ExpirationDate::Days(pos_or_panic!(30.0))));
+        drop(manager.get_or_create(ExpirationDate::Days(pos_or_panic!(60.0))));
+
+        let count = manager.iter().count();
+        assert_eq!(count, 2);
+    }
 }

@@ -371,4 +371,36 @@ mod tests {
         assert_eq!(trade, "oc.trades.BTC.20240329.50000.C");
         assert_eq!(book, "oc.book.BTC.20240329.50000.C");
     }
+
+    // ── from_symbol validation edge cases ────────────────────────────────
+
+    #[test]
+    fn test_from_symbol_empty_underlying() {
+        let result = OptionChainSubjectBuilder::from_symbol("-20240329-50000-C");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_symbol_empty_strike() {
+        let result = OptionChainSubjectBuilder::from_symbol("BTC-20240329--C");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_symbol_nats_wildcard_in_underlying() {
+        let result = OptionChainSubjectBuilder::from_symbol("BT*C-20240329-50000-C");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_symbol_nats_dot_in_strike() {
+        let result = OptionChainSubjectBuilder::from_symbol("BTC-20240329-50.000-C");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_symbol_nats_greater_than_in_expiry() {
+        let result = OptionChainSubjectBuilder::from_symbol("BTC-2024>329-50000-C");
+        assert!(result.is_err());
+    }
 }
