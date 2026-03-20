@@ -222,6 +222,27 @@ pub trait OptionChainJournal: Send + Sync {
     fn entry_count(&self) -> Result<Option<u64>, Error> {
         Ok(None)
     }
+
+    /// Reads up to `limit` events starting from the given sequence number.
+    ///
+    /// This enables OOM-safe streaming replay by limiting allocation at the
+    /// source instead of loading all entries and truncating afterwards.
+    ///
+    /// The default implementation falls back to [`read_from`](Self::read_from)
+    /// and truncates the result. Implementations that can efficiently limit
+    /// reads at the source should override this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if deserialization or I/O fails.
+    fn read_from_with_limit(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<OptionChainEvent>, Error> {
+        let all = self.read_from(sequence)?;
+        Ok(all.into_iter().take(limit).collect())
+    }
 }
 
 /// In-memory journal for testing and lightweight usage.
@@ -294,6 +315,23 @@ impl OptionChainJournal for InMemoryOptionChainJournal {
             .lock()
             .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
         Ok(Some(guard.len() as u64))
+    }
+
+    fn read_from_with_limit(
+        &self,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<OptionChainEvent>, Error> {
+        let guard = self
+            .events
+            .lock()
+            .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
+        Ok(guard
+            .iter()
+            .filter(|e| e.sequence_num >= sequence)
+            .take(limit)
+            .cloned()
+            .collect())
     }
 }
 
@@ -1204,6 +1242,46 @@ mod tests {
         }
 
         assert_eq!(journal.entry_count().expect("count"), Some(5));
+    }
+
+    #[test]
+    fn test_in_memory_journal_read_from_with_limit() {
+        let journal = InMemoryOptionChainJournal::new();
+
+        for i in 0..10 {
+            let event = OptionChainEvent {
+                sequence_num: i,
+                timestamp_ns: i * 1000,
+                command: OptionChainCommand::CancelOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::new(),
+                },
+                result: OptionChainResult::Rejected {
+                    reason: "test".to_string(),
+                },
+            };
+            journal.append(&event).expect("append");
+        }
+
+        // Read with limit smaller than available
+        let limited = journal.read_from_with_limit(0, 3).expect("read");
+        assert_eq!(limited.len(), 3);
+        assert_eq!(limited[0].sequence_num, 0);
+        assert_eq!(limited[2].sequence_num, 2);
+
+        // Read with limit larger than available
+        let all = journal.read_from_with_limit(0, 100).expect("read");
+        assert_eq!(all.len(), 10);
+
+        // Read with offset and limit
+        let offset = journal.read_from_with_limit(5, 3).expect("read");
+        assert_eq!(offset.len(), 3);
+        assert_eq!(offset[0].sequence_num, 5);
+        assert_eq!(offset[2].sequence_num, 7);
+
+        // Read beyond end returns empty
+        let empty = journal.read_from_with_limit(100, 5).expect("read");
+        assert!(empty.is_empty());
     }
 
     // ── Journaled sequenced book ────────────────────────────────────────
