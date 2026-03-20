@@ -212,10 +212,16 @@ pub trait OptionChainJournal: Send + Sync {
     /// This allows callers to check journal size without loading entries,
     /// enabling memory-conscious decisions before replay operations.
     ///
+    /// The default implementation returns `None` to indicate the count is
+    /// unavailable. Implementations that can efficiently count entries
+    /// should override this method.
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] if counting fails (e.g., I/O error for file journals).
-    fn entry_count(&self) -> Result<u64, Error>;
+    fn entry_count(&self) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
 }
 
 /// In-memory journal for testing and lightweight usage.
@@ -282,12 +288,12 @@ impl OptionChainJournal for InMemoryOptionChainJournal {
         }
     }
 
-    fn entry_count(&self) -> Result<u64, Error> {
+    fn entry_count(&self) -> Result<Option<u64>, Error> {
         let guard = self
             .events
             .lock()
             .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
-        Ok(guard.len() as u64)
+        Ok(Some(guard.len() as u64))
     }
 }
 
@@ -1175,7 +1181,7 @@ mod tests {
     #[test]
     fn test_in_memory_journal_entry_count_empty() {
         let journal = InMemoryOptionChainJournal::new();
-        assert_eq!(journal.entry_count().expect("count"), 0);
+        assert_eq!(journal.entry_count().expect("count"), Some(0));
     }
 
     #[test]
@@ -1197,7 +1203,7 @@ mod tests {
             journal.append(&event).expect("append");
         }
 
-        assert_eq!(journal.entry_count().expect("count"), 5);
+        assert_eq!(journal.entry_count().expect("count"), Some(5));
     }
 
     // ── Journaled sequenced book ────────────────────────────────────────
