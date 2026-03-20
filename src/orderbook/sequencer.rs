@@ -206,6 +206,22 @@ pub trait OptionChainJournal: Send + Sync {
     /// Returns the sequence number of the last entry, or `None` if empty.
     #[must_use]
     fn last_sequence(&self) -> Option<u64>;
+
+    /// Returns the total number of entries in the journal.
+    ///
+    /// This allows callers to check journal size without loading entries,
+    /// enabling memory-conscious decisions before replay operations.
+    ///
+    /// The default implementation returns `None` to indicate the count is
+    /// unavailable. Implementations that can efficiently count entries
+    /// should override this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if counting fails (e.g., I/O error for file journals).
+    fn entry_count(&self) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
 }
 
 /// In-memory journal for testing and lightweight usage.
@@ -270,6 +286,14 @@ impl OptionChainJournal for InMemoryOptionChainJournal {
             Ok(guard) => guard.last().map(|e| e.sequence_num),
             Err(poisoned) => poisoned.into_inner().last().map(|e| e.sequence_num),
         }
+    }
+
+    fn entry_count(&self) -> Result<Option<u64>, Error> {
+        let guard = self
+            .events
+            .lock()
+            .map_err(|e| Error::journal_error(format!("lock poisoned: {}", e)))?;
+        Ok(Some(guard.len() as u64))
     }
 }
 
@@ -1152,6 +1176,34 @@ mod tests {
 
         let from_10 = journal.read_from(10).expect("read");
         assert!(from_10.is_empty());
+    }
+
+    #[test]
+    fn test_in_memory_journal_entry_count_empty() {
+        let journal = InMemoryOptionChainJournal::new();
+        assert_eq!(journal.entry_count().expect("count"), Some(0));
+    }
+
+    #[test]
+    fn test_in_memory_journal_entry_count_with_entries() {
+        let journal = InMemoryOptionChainJournal::new();
+
+        for i in 0..5 {
+            let event = OptionChainEvent {
+                sequence_num: i,
+                timestamp_ns: i * 1000,
+                command: OptionChainCommand::CancelOrder {
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    order_id: OrderId::new(),
+                },
+                result: OptionChainResult::Rejected {
+                    reason: "test".to_string(),
+                },
+            };
+            journal.append(&event).expect("append");
+        }
+
+        assert_eq!(journal.entry_count().expect("count"), Some(5));
     }
 
     // ── Journaled sequenced book ────────────────────────────────────────
